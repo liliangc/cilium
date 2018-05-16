@@ -1,66 +1,43 @@
-FROM ubuntu:16.04
-
-LABEL "Maintainer: Andre Martins <andre@cilium.io>"
-
-ADD . /tmp/cilium-net-build/src/github.com/cilium/cilium
-
-RUN apt-get update && \
-apt-get install -y --no-install-recommends gcc make libelf-dev bison flex git libc6-dev.i386 && \
 #
-# clang-3.8.1-begin
-apt-get install -y --no-install-recommends curl xz-utils && \
-cd /tmp && \
-gpg --import /tmp/cilium-net-build/src/github.com/cilium/cilium/contrib/packaging/docker/clang-3.8.1.key && \
-curl -Ssl -o clang+llvm.tar.xz \
-http://releases.llvm.org/3.8.1/clang+llvm-3.8.1-x86_64-linux-gnu-ubuntu-16.04.tar.xz && \
-curl -Ssl -o clang+llvm.tar.xz.sig \
-http://releases.llvm.org/3.8.1/clang+llvm-3.8.1-x86_64-linux-gnu-ubuntu-16.04.tar.xz.sig && \
-gpg --verify clang+llvm.tar.xz.sig && \
-mkdir -p /usr/local && \
-tar -C /usr/local -xJf ./clang+llvm.tar.xz && \
-mv /usr/local/clang+llvm-3.8.1-x86_64-linux-gnu-ubuntu-16.04 /usr/local/clang+llvm && \
-rm clang+llvm.tar.xz && \
-rm -fr /usr/local/clang+llvm/include/llvm-c && \
-rm -fr /usr/local/clang+llvm/include/clang-c && \
-rm -fr /usr/local/clang+llvm/include/c++ && \
-rm -fr /usr/local/clang+llvm/share && \
-ls -d /usr/local/clang+llvm/lib/* | grep -vE clang$ | xargs rm -r && \
-ls -d /usr/local/clang+llvm/bin/* | grep -vE "clang$|clang-3.8$|llc$" | xargs rm -r && \
-# clang-3.8.1-end
+# Cilium incremental build. Should be fast given builder-deps is up-to-date!
 #
-# iproute2-begin
-cd /tmp && \
-git clone -b v4.10.0 git://git.kernel.org/pub/scm/linux/kernel/git/shemminger/iproute2.git && \
-cd /tmp/iproute2 && \
-./configure && \
-make -j `getconf _NPROCESSORS_ONLN` && \
-make install && \
-# iproute2-end
+# cilium-builder tag is the date on which the compatible build image
+# was pushed.  If a new version of the build image is needed, it needs
+# to be tagged with a new date and this file must be changed
+# accordingly.  Keeping the old images available will allow older
+# versions to be built while allowing the new versions to make changes
+# that are not backwards compatible.
 #
-# cilium-begin
+FROM quay.io/cilium/cilium-builder:2018-04-23 as builder
+LABEL maintainer="maintainer@cilium.io"
+WORKDIR /go/src/github.com/cilium/cilium
+COPY . ./
+ARG LOCKDEBUG
+#
+# Please do not add any dependency updates before the 'make install' here,
+# as that will mess with caching for incremental builds!
+#
+RUN make LOCKDEBUG=$LOCKDEBUG PKG_BUILD=1 DESTDIR=/tmp/install clean-container build install
 
-cd /tmp && \
-curl -Sslk -o go.linux-amd64.tar.gz \
-https://storage.googleapis.com/golang/go1.8.1.linux-amd64.tar.gz && \
-tar -C /usr/local -xzf go.linux-amd64.tar.gz && \
-cd /tmp/cilium-net-build/src/github.com/cilium/cilium && \
-export GOROOT=/usr/local/go && \
-export GOPATH=/tmp/cilium-net-build && \
-export PATH="$GOROOT/bin:/usr/local/clang+llvm/bin:$PATH" && \
-make && \
-make PKG_BUILD=1 install && \
-groupadd -f cilium && \
-# cilium-end
 #
-apt-get purge --auto-remove -y gcc make bison flex git curl xz-utils && \
-# Needed for system minimal requirements checkers
-apt-get install -y --no-install-recommends libgcc-5-dev binutils && \
-apt-get clean && \
-rm -fr /root /var/lib/apt/lists/* /tmp/* /var/tmp/* /usr/local/go && \
-echo '#!/usr/bin/env bash\ncp /opt/cni/bin/cilium-cni /tmp/cni/bin && /usr/bin/cilium-agent $@' > /home/with-cni.sh && \
-chmod +x /home/with-cni.sh
-
-ENV PATH="/usr/local/clang+llvm/bin:$PATH"
+# Cilium runtime install.
+#
+# cilium-runtime tag is a date on which the compatible runtime base
+# was pushed.  If a new version of the runtime is needed, it needs to
+# be tagged with a new date and this file must be changed accordingly.
+# Keeping the old runtimes available will allow older versions to be
+# built while allowing the new versions to make changes that are not
+# backwards compatible.
+#
+FROM quay.io/cilium/cilium-runtime:2018-04-10
+LABEL maintainer="maintainer@cilium.io"
+COPY --from=builder /tmp/install /
+COPY plugins/cilium-cni/cni-install.sh /cni-install.sh
+COPY plugins/cilium-cni/cni-uninstall.sh /cni-uninstall.sh
+WORKDIR /root
+RUN groupadd -f cilium \
+	&& echo ". /etc/profile.d/bash_completion.sh" >> /root/.bashrc \
+    && cilium completion bash >> /root/.bashrc \
+    && sysctl -w kernel.core_pattern=/tmp/core.%e.%p.%t
 ENV INITSYSTEM="SYSTEMD"
-
 CMD ["/usr/bin/cilium"]

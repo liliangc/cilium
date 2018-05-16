@@ -17,57 +17,54 @@ package common
 const (
 	// Consul dedicated constants
 
-	// OperationalPath is the base path to store the operational details in consul.
+	// OperationalPath is the base path to store the operational details in the kvstore.
 	OperationalPath = "cilium-net/operational"
 
-	// LastFreeLabelIDKeyPath is the path where the Last free UUID is stored in consul.
+	// LastFreeLabelIDKeyPath is the path where the Last free UUID is stored in the kvstore.
 	LastFreeLabelIDKeyPath = OperationalPath + "/Labels/LastUUID"
-	// LabelsKeyPath is the base path where labels are stored in consul.
+	// LabelsKeyPath is the base path where labels are stored in the kvstore.
 	LabelsKeyPath = OperationalPath + "/Labels/SHA256SUMLabels"
-	// LabelIDKeyPath is the base path where the IDs are stored in consul.
+	// LabelIDKeyPath is the base path where the IDs are stored in the kvstore.
 	LabelIDKeyPath = OperationalPath + "/Labels/IDs"
-	// MaxSetOfLabels is maximum number of set of labels that can be stored in consul.
+	// MaxSetOfLabels is maximum number of set of labels that can be stored in the kvstore.
 	MaxSetOfLabels = uint32(0xFFFF)
-	// LastFreeServiceIDKeyPath is the path where the Last free UUID is stored in consul.
-	LastFreeServiceIDKeyPath = OperationalPath + "/Services/LastUUID"
-	// ServicesKeyPath is the base path where services are stored in consul.
-	ServicesKeyPath = OperationalPath + "/Services/SHA256SUMServices"
-	// ServiceIDKeyPath is the base path where the IDs are stored in consul.
-	ServiceIDKeyPath = OperationalPath + "/Services/IDs"
-	// MaxSetOfServiceID is maximum number of set of service IDs that can be stored in consul.
+	// LastFreeServiceIDKeyPath is the path where the Last free UUID is stored in the kvstore.
+	LastFreeServiceIDKeyPath = OperationalPath + "/ServicesV2/LastUUID"
+	// ServicesKeyPath is the base path where services are stored in the kvstore.
+	ServicesKeyPath = OperationalPath + "/ServicesV2/SHA256SUMServices"
+	// ServiceIDKeyPath is the base path where the IDs are stored in the kvstore.
+	ServiceIDKeyPath = OperationalPath + "/ServicesV2/IDs"
+	// ServicePathV1 is the base path for the services stored in the kvstore.
+	ServicePathV1 = OperationalPath + "/Services/"
+	// MaxSetOfServiceID is maximum number of set of service IDs that can be stored in the kvstore.
 	MaxSetOfServiceID = uint32(0xFFFF)
 	// FirstFreeServiceID is the first ID for which the services should be assigned.
 	FirstFreeServiceID = uint32(1)
 
 	// Miscellaneous dedicated constants
 
-	// CiliumLabelSource is the default label source for the labels read from containers.
-	CiliumLabelSource = "cilium"
-	// K8sLabelSource is the default label source for the labels read from kubernetes.
-	K8sLabelSource = "k8s"
-	// K8sLabelPrefix is the default prefix used to represent kubernetes labels
-	K8sLabelPrefix = "io.cilium.k8s."
-	// K8sPodNamespaceLabel is the label used in kubernetes containers to specify
-	// which namespace they belong to.
-	K8sPodNamespaceLabel = "io.kubernetes.pod.namespace"
-	// ReservedLabelSource is the label source for reserved types.
-	ReservedLabelSource = "reserved"
-	// ReservedLabelKey is the label used to represent the reserved source.
-	ReservedLabelKey = "io.cilium." + ReservedLabelSource
-	// EndpointsPerHost is the maximum number of endpoints allowed per host. It should
-	// represent the same number of IPv6 addresses supported on each node.
-	EndpointsPerHost = 0xFFFF
-	// GroupFilePath is the unix group file path.
-	GroupFilePath = "/etc/group"
-	// CiliumGroupName is the cilium's unix group name.
-	CiliumGroupName = "cilium"
+	// PathDelimiter is the delimiter used in the labels paths.
+	PathDelimiter = "."
 
+	// NodeConfigFile is the name of the C header which contains the node's
+	// network parameters.
+	NodeConfigFile = "node_config.h"
 	// CHeaderFileName is the name of the C header file for BPF programs for a
 	// particular endpoint.
 	CHeaderFileName = "lxc_config.h"
 	// NetdevHeaderFileName is the name of the header file used for bpf_netdev.c and bpf_overlay.c.
 	NetdevHeaderFileName = "netdev_config.h"
+	// PreFilterHeaderFileName is the name of the header file used for bpf_xdp.c.
+	PreFilterHeaderFileName = "filter_config.h"
 	// CiliumCHeaderPrefix is the prefix using when printing/writing an endpoint in a
 	// base64 form.
 	CiliumCHeaderPrefix = "CILIUM_BASE64_"
+
+	// CiliumK8sAnnotationPrefix is the prefix key for the annotations used in kubernetes.
+	CiliumK8sAnnotationPrefix = "cilium.io/"
+
+	// CiliumIdentityAnnotation is the annotation key used to map to an endpoint's security identity.
+	CiliumIdentityAnnotation = CiliumK8sAnnotationPrefix + "identity"
+	// CiliumIdentityAnnotationDeprecated is the previous annotation key used to map to an endpoint's security identity.
+	CiliumIdentityAnnotationDeprecated = "cilium-identity"
 )

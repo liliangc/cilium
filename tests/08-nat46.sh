@@ -1,17 +1,36 @@
 #!/bin/bash
 
-source "./helpers.bash"
+dir=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
+source "${dir}/helpers.bash"
+# dir might have been overwritten by helpers.bash
+dir=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
 
-set -e
+TEST_NAME=$(get_filename_without_extension $0)
+LOGS_DIR="${dir}/cilium-files/${TEST_NAME}/logs"
+redirect_debug_logs ${LOGS_DIR}
 
-TEST_NET="cilium"
+set -ex
+
+log "${TEST_NAME} has been deprecated and replaced by test/runtime/connectivity.go:Test NAT46 connectivity between containers"
+exit 0
 
 function cleanup {
-        docker rm -f server client 2> /dev/null || true
-        monitor_stop
+  log "beginning cleanup for ${TEST_NAME}"
+  cilium policy delete --all 2> /dev/null || true
+  docker rm -f server client 2> /dev/null || true
+  monitor_stop
+  log "finished cleanup for ${TEST_NAME}"
 }
 
-trap cleanup EXIT
+function finish_test {
+  log "beginning finish_test for ${TEST_NAME}"
+  gather_files ${TEST_NAME} ${TEST_SUITE}
+  cleanup
+  log "done with finish_test for ${TEST_NAME}"
+}
+
+trap finish_test EXIT
+cleanup
 
 SERVER_LABEL="id.server"
 CLIENT_LABEL="id.client"
@@ -20,12 +39,12 @@ NETPERF_IMAGE="tgraf/netperf"
 monitor_start
 logs_clear
 
-docker network inspect $TEST_NET 2> /dev/null || {
-        docker network create --ipv6 --subnet ::1/112 --ipam-driver cilium --driver cilium $TEST_NET
-}
+create_cilium_docker_network
 
+log "starting containers"
 docker run -d -i --net=$TEST_NET --name server -l $SERVER_LABEL $NETPERF_IMAGE
 docker run -d -i --net=$TEST_NET --name client -l $CLIENT_LABEL $NETPERF_IMAGE
+log "done starting containers"
 
 CLIENT_IP=$(docker inspect --format '{{ .NetworkSettings.Networks.cilium.GlobalIPv6Address }}' client)
 CLIENT_IP4=$(docker inspect --format '{{ .NetworkSettings.Networks.cilium.IPAddress }}' client)
@@ -34,37 +53,44 @@ SERVER_IP=$(docker inspect --format '{{ .NetworkSettings.Networks.cilium.GlobalI
 SERVER_IP4=$(docker inspect --format '{{ .NetworkSettings.Networks.cilium.IPAddress }}' server)
 SERVER_ID=$(cilium endpoint list | grep $SERVER_IP | awk '{ print $1}')
 
-echo CLIENT_IP=$CLIENT_IP
-echo CLIENT_IP4=$CLIENT_IP4
-echo CLIENT_ID=$CLIENT_ID
-echo SERVER_IP=$SERVER_IP
-echo SERVER_IP4=$SERVER_IP4
-echo SERVER_ID=$SERVER_ID
+log "CLIENT_IP=$CLIENT_IP"
+log "CLIENT_IP4=$CLIENT_IP4"
+log "CLIENT_ID=$CLIENT_ID"
+log "SERVER_IP=$SERVER_IP"
+log "SERVER_IP4=$SERVER_IP4"
+log "SERVER_ID=$SERVER_ID"
 
-# FIXME IPv6 DAD period
-sleep 5
-set -x
+wait_for_docker_ipv6_addr client
+wait_for_docker_ipv6_addr server
 
-cat <<EOF | cilium -D policy import -
-{
-        "name": "root",
-	"rules": [{
-		"coverage": ["$SERVER_LABEL"],
-		"allow": ["$CLIENT_LABEL"]
-	}]
-}
+cat <<EOF | policy_import_and_wait -
+[{
+    "endpointSelector": {"matchLabels":{"${SERVER_LABEL}":""}},
+    "ingress": [{
+        "fromEndpoints": [
+	    {"matchLabels":{"${CLIENT_LABEL}":""}}
+	]
+    }]
+}]
 EOF
 
+log "updating client endpoint configuration: NAT46=true"
 cilium endpoint config ${CLIENT_ID} NAT46=true
-cilium endpoint config ${SERVER_ID} NAT46=true
 
-function connectivity_test64() {
-        # ICMPv4 echo request from client to server should succeed
-        monitor_clear
-        docker exec -i client ping6 -c 5 ::FFFF:$SERVER_IP4 || {
-                abort "Error: Could not ping nat64 address of client from host"
-        }
+function connectivity_test46() {
+  log "beginning connectivity_test46"
+  # ICMPv4 echo request from client to server should succeed
+  monitor_clear
+  log "pinging NAT46 address of server from client (should work)" 
+  docker exec -i client ping6 -c 10 ::FFFF:$SERVER_IP4 || {
+    abort "Error: Could not ping nat46 address of server from client"
+  }
+  log "finished connectivity_test46"
 }
 
-connectivity_test64
-cilium -D policy delete root
+connectivity_test46
+log "deleting all policies from Cilium"
+cilium -D policy delete --all
+
+test_succeeded "${TEST_NAME}"
+

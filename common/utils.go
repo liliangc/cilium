@@ -20,11 +20,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
-	"time"
-
-	l "github.com/op/go-logging"
 )
 
 // goArray2C transforms a byte slice into its hexadecimal string representation.
@@ -32,7 +28,8 @@ import (
 // array := []byte{0x12, 0xFF, 0x0, 0x01}
 // fmt.Print(GoArray2C(array)) // "{ 0x12, 0xff, 0x0, 0x1 }"
 func goArray2C(array []byte) string {
-	ret := "{ "
+	ret := ""
+
 	for i, e := range array {
 		if i == 0 {
 			ret = ret + fmt.Sprintf("%#x", e)
@@ -40,84 +37,25 @@ func goArray2C(array []byte) string {
 			ret = ret + fmt.Sprintf(", %#x", e)
 		}
 	}
+	return ret
+}
 
-	return ret + " }"
+func FmtDefineComma(name string, addr []byte) string {
+	return fmt.Sprintf("#define %s %s\n", name, goArray2C(addr))
 }
 
 // FmtDefineAddress returns the a define string from the given name and addr.
 // Example:
 // fmt.Print(FmtDefineAddress("foo", []byte{1, 2, 3})) // "#define foo { .addr = { 0x1, 0x2, 0x3 } }\n"
 func FmtDefineAddress(name string, addr []byte) string {
-	return fmt.Sprintf("#define %s { .addr = %s }\n", name, goArray2C(addr))
+	return fmt.Sprintf("#define %s { .addr = { %s } }\n", name, goArray2C(addr))
 }
 
 // FmtDefineArray returns the a define string from the given name and array.
 // Example:
 // fmt.Print(FmtDefineArray("foo", []byte{1, 2, 3})) // "#define foo { 0x1, 0x2, 0x3 }\n"
 func FmtDefineArray(name string, array []byte) string {
-	return fmt.Sprintf("#define %s %s\n", name, goArray2C(array))
-}
-
-// Swab16 swaps the endianness of n.
-func Swab16(n uint16) uint16 {
-	return (n&0xFF00)>>8 | (n&0x00FF)<<8
-}
-
-// Swab32 swaps the endianness of n.
-func Swab32(n uint32) uint32 {
-	return ((n & 0x000000ff) << 24) | ((n & 0x0000ff00) << 8) |
-		((n & 0x00ff0000) >> 8) | ((n & 0xff000000) >> 24)
-}
-
-// SetupLOG sets up logger with the correct parameters for the whole cilium architecture.
-func SetupLOG(logger *l.Logger, logLevel string) {
-
-	var fileFormat l.Formatter
-	switch os.Getenv("INITSYSTEM") {
-	case "SYSTEMD":
-		fileFormat = l.MustStringFormatter(
-			`%{level:.4s} %{message}`)
-	default:
-		fileFormat = l.MustStringFormatter(
-			`%{color}%{time:` + time.RFC3339 +
-				`} %{level:.4s} %{color:reset}%{message}`)
-	}
-
-	level, err := l.LogLevel(logLevel)
-	if err != nil {
-		logger.Fatal(err)
-	}
-
-	backend := l.NewLogBackend(os.Stderr, "", 0)
-	oBF := l.NewBackendFormatter(backend, fileFormat)
-
-	backendLeveled := l.SetBackend(oBF)
-	backendLeveled.SetLevel(level, "")
-	logger.SetBackend(backendLeveled)
-}
-
-// GetGroupIDByName returns the group ID for the given grpName.
-func GetGroupIDByName(grpName string) (int, error) {
-	f, err := os.Open(GroupFilePath)
-	if err != nil {
-		return -1, err
-	}
-	defer f.Close()
-	br := bufio.NewReader(f)
-	for {
-		s, err := br.ReadString('\n')
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return -1, err
-		}
-		p := strings.Split(s, ":")
-		if len(p) >= 3 && p[0] == grpName {
-			return strconv.Atoi(p[2])
-		}
-	}
-	return -1, fmt.Errorf("group %q not found", grpName)
+	return fmt.Sprintf("#define %s { %s }\n", name, goArray2C(array))
 }
 
 // FindEPConfigCHeader returns the full path of the file that is the CHeaderFileName from
@@ -150,5 +88,13 @@ func GetCiliumVersionString(epCHeaderFilePath string) (string, error) {
 		if strings.Contains(s, CiliumCHeaderPrefix) {
 			return s, nil
 		}
+	}
+}
+
+// RequireRootPrivilege checks if the user running cmd is root. If not, it exits the program
+func RequireRootPrivilege(cmd string) {
+	if os.Getuid() != 0 {
+		fmt.Fprintf(os.Stderr, "Please run %q command(s) with root privileges.\n", cmd)
+		os.Exit(1)
 	}
 }

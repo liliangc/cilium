@@ -32,8 +32,6 @@
 
 #include "csum.h"
 
-/* FIXME: Make configurable */
-#define CILIUM_LB_MAP_MAX_ENTRIES	65536
 #define CILIUM_LB_MAP_MAX_FE		256
 
 struct bpf_elf_map __section_maps cilium_lb6_reverse_nat = {
@@ -85,9 +83,9 @@ struct bpf_elf_map __section_maps cilium_lb4_rr_seq = {
 };
 #define REV_NAT_F_TUPLE_SADDR 1
 #ifdef LB_DEBUG
-#define cilium_trace_lb cilium_trace
+#define cilium_dbg_lb cilium_dbg
 #else
-#define cilium_trace_lb(a, b, c, d)
+#define cilium_dbg_lb(a, b, c, d)
 #endif
 
 #ifdef HAVE_MAP_VAL_ADJ
@@ -101,7 +99,7 @@ static inline int lb_next_rr(struct __sk_buff *skb,
 	if (offset < LB_RR_MAX_SEQ) {
 		/* Slave 0 is reserved for the master slot */
 		slave = seq->idx[offset] + 1;
-		cilium_trace(skb, DBG_RR_SLAVE_SEL, hash, slave);
+		cilium_dbg(skb, DBG_RR_SLAVE_SEL, hash, slave);
 	}
 
 	return slave;
@@ -129,7 +127,15 @@ static inline int lb6_select_slave(struct __sk_buff *skb,
 	__u32 hash = lb_enforce_rehash(skb);
 	int slave = 0;
 
-#ifdef HAVE_MAP_VAL_ADJ
+/* Disabled for now since on older kernels dynamic map access
+ * will cause a significant complexity increase for the entire
+ * program due to pruning having less opportunities matching
+ * register state in the verifier. For later kernels this is
+ * less of a problem, so we can enabled to in future based on
+ * changing the HAVE_MAP_VAL_ADJ probe. Thus just do the slave
+ * selection based on hash instead of hash w/ weights.
+ */
+#if 0 /* HAVE_MAP_VAL_ADJ */
 	if (weight) {
 		struct lb_sequence *seq;
 
@@ -142,7 +148,7 @@ static inline int lb6_select_slave(struct __sk_buff *skb,
 	if (slave == 0) {
 		/* Slave 0 is reserved for the master slot */
 		slave = (hash % count) + 1;
-		cilium_trace(skb, DBG_PKT_HASH, hash, slave);
+		cilium_dbg(skb, DBG_PKT_HASH, hash, slave);
 	}
 
 	return slave;
@@ -155,7 +161,15 @@ static inline int lb4_select_slave(struct __sk_buff *skb,
 	__u32 hash = lb_enforce_rehash(skb);
 	int slave = 0;
 
-#ifdef HAVE_MAP_VAL_ADJ
+/* Disabled for now since on older kernels dynamic map access
+ * will cause a significant complexity increase for the entire
+ * program due to pruning having less opportunities matching
+ * register state in the verifier. For later kernels this is
+ * less of a problem, so we can enabled to in future based on
+ * changing the HAVE_MAP_VAL_ADJ probe. Thus just do the slave
+ * selection based on hash instead of hash w/ weights.
+ */
+#if 0 /* HAVE_MAP_VAL_ADJ */
 	if (weight) {
 		struct lb_sequence *seq;
 
@@ -168,14 +182,14 @@ static inline int lb4_select_slave(struct __sk_buff *skb,
 	if (slave == 0) {
 		/* Slave 0 is reserved for the master slot */
 		slave = (hash % count) + 1;
-		cilium_trace_lb(skb, DBG_PKT_HASH, hash, slave);
+		cilium_dbg_lb(skb, DBG_PKT_HASH, hash, slave);
 	}
 
 	return slave;
 }
 
 static inline int __inline__ extract_l4_port(struct __sk_buff *skb, __u8 nexthdr,
-					     int l4_off, __u16 *port)
+					     int l4_off, __be16 *port)
 {
 	int ret;
 
@@ -201,14 +215,14 @@ static inline int __inline__ extract_l4_port(struct __sk_buff *skb, __u8 nexthdr
 }
 
 static inline int __inline__ reverse_map_l4_port(struct __sk_buff *skb, __u8 nexthdr,
-						 __u16 port, int l4_off,
+						 __be16 port, int l4_off,
 						 struct csum_offset *csum_off)
 {
 	switch (nexthdr) {
 	case IPPROTO_TCP:
 	case IPPROTO_UDP:
 		if (port) {
-			__u16 old_port;
+			__be16 old_port;
 			int ret;
 
 			/* Port offsets for UDP and TCP are the same */
@@ -247,7 +261,7 @@ static inline int __inline__ __lb6_rev_nat(struct __sk_buff *skb, int l4_off,
 	__be32 sum;
 	int ret;
 
-	cilium_trace_lb(skb, DBG_LB6_REVERSE_NAT, nat->address.p4, nat->port);
+	cilium_dbg_lb(skb, DBG_LB6_REVERSE_NAT, nat->address.p4, nat->port);
 
 	if (nat->port) {
 		ret = reverse_map_l4_port(skb, tuple->nexthdr, nat->port, l4_off, csum_off);
@@ -256,15 +270,9 @@ static inline int __inline__ __lb6_rev_nat(struct __sk_buff *skb, int l4_off,
 	}
 
 	if (flags & REV_NAT_F_TUPLE_SADDR) {
-#ifdef CONNTRACK_LOCAL
-		ipv6_addr_copy(&old_saddr, &tuple->addr);
-		ipv6_addr_copy(&tuple->addr, &nat->address);
-		new_saddr = tuple->addr.addr;
-#else
 		ipv6_addr_copy(&old_saddr, &tuple->saddr);
 		ipv6_addr_copy(&tuple->saddr, &nat->address);
 		new_saddr = tuple->saddr.addr;
-#endif
 	} else {
 		if (ipv6_load_saddr(skb, ETH_HLEN, &old_saddr) < 0)
 			return DROP_INVALID;
@@ -299,7 +307,7 @@ static inline int __inline__ lb6_rev_nat(struct __sk_buff *skb, int l4_off,
 {
 	struct lb6_reverse_nat *nat;
 
-	cilium_trace_lb(skb, DBG_LB6_REVERSE_NAT_LOOKUP, index, 0);
+	cilium_dbg_lb(skb, DBG_LB6_REVERSE_NAT_LOOKUP, index, 0);
 	nat = map_lookup_elem(&cilium_lb6_reverse_nat, &index);
 	if (nat == NULL)
 		return 0;
@@ -327,11 +335,8 @@ static inline int __inline__ lb6_extract_key(struct __sk_buff *skb, struct ipv6_
 					     struct csum_offset *csum_off, int dir)
 {
 	union v6addr *addr;
-#ifdef CONNTRACK_LOCAL
-	addr = &tuple->addr;
-#else
+
 	addr = (dir == CT_INGRESS) ? &tuple->saddr : &tuple->daddr;
-#endif
 	ipv6_addr_copy(&key->address, addr);
 	csum_l4_offset_and_flags(tuple->nexthdr, csum_off);
 
@@ -349,7 +354,7 @@ static inline struct lb6_service *lb6_lookup_service(struct __sk_buff *skb,
 	if (key->dport) {
 		struct lb6_service *svc;
 
-		cilium_trace_lb(skb, DBG_LB6_LOOKUP_MASTER, key->address.p4, key->dport);
+		cilium_dbg_lb(skb, DBG_LB6_LOOKUP_MASTER, key->address.p4, key->dport);
 		svc = map_lookup_elem(&cilium_lb6_services, key);
 		if (svc && svc->count != 0)
 			return svc;
@@ -362,14 +367,14 @@ static inline struct lb6_service *lb6_lookup_service(struct __sk_buff *skb,
 	if (1) {
 		struct lb6_service *svc;
 
-		cilium_trace_lb(skb, DBG_LB6_LOOKUP_MASTER, key->address.p4, key->dport);
+		cilium_dbg_lb(skb, DBG_LB6_LOOKUP_MASTER, key->address.p4, key->dport);
 		svc = map_lookup_elem(&cilium_lb6_services, key);
 		if (svc && svc->count != 0)
 			return svc;
 	}
 #endif
 
-	cilium_trace_lb(skb, DBG_LB6_LOOKUP_MASTER_FAIL, key->address.p2, key->address.p3);
+	cilium_dbg_lb(skb, DBG_LB6_LOOKUP_MASTER_FAIL, key->address.p2, key->address.p3);
 	return NULL;
 }
 
@@ -379,10 +384,10 @@ static inline struct lb6_service *lb6_lookup_slave(struct __sk_buff *skb,
 	struct lb6_service *svc;
 
 	key->slave = slave;
-	cilium_trace_lb(skb, DBG_LB6_LOOKUP_SLAVE, key->slave, key->dport);
+	cilium_dbg_lb(skb, DBG_LB6_LOOKUP_SLAVE, key->slave, key->dport);
 	svc = map_lookup_elem(&cilium_lb6_services, key);
 	if (svc != NULL) {
-		cilium_trace_lb(skb, DBG_LB6_LOOKUP_SLAVE_SUCCESS, svc->target.p4, svc->port);
+		cilium_dbg_lb(skb, DBG_LB6_LOOKUP_SLAVE_SUCCESS, svc->target.p4, svc->port);
 		return svc;
 	}
 
@@ -404,7 +409,7 @@ static inline int __inline__ lb6_xlate(struct __sk_buff *skb, union v6addr *new_
 #ifdef LB_L4
 	if (svc->port && key->dport != svc->port &&
 	    (nexthdr == IPPROTO_TCP || nexthdr == IPPROTO_UDP)) {
-		__u16 tmp = svc->port;
+		__be16 tmp = svc->port;
 		int ret;
 
 		/* Port offsets for UDP and TCP are the same */
@@ -429,13 +434,8 @@ static inline int __inline__ lb6_local(struct __sk_buff *skb, int l3_off, int l4
 	if (!(svc = lb6_lookup_slave(skb, key, slave)))
 		return DROP_NO_SERVICE;
 
-#ifdef CONNTRACK_LOCAL
-	ipv6_addr_copy(&tuple->addr, &svc->target);
-	addr = &tuple->addr;
-#else
 	ipv6_addr_copy(&tuple->daddr, &svc->target);
 	addr = &tuple->daddr;
-#endif
 
 	if (state)
 		state->rev_nat_index = svc->rev_nat_index;
@@ -453,7 +453,7 @@ static inline int __inline__ __lb4_rev_nat(struct __sk_buff *skb, int l3_off, in
 	__be32 old_sip, new_sip, sum = 0;
 	int ret;
 
-	cilium_trace_lb(skb, DBG_LB4_REVERSE_NAT, nat->address, nat->port);
+	cilium_dbg_lb(skb, DBG_LB4_REVERSE_NAT, nat->address, nat->port);
 
 	if (nat->port) {
 		ret = reverse_map_l4_port(skb, tuple->nexthdr, nat->port, l4_off, csum_off);
@@ -462,13 +462,8 @@ static inline int __inline__ __lb4_rev_nat(struct __sk_buff *skb, int l3_off, in
 	}
 
 	if (flags & REV_NAT_F_TUPLE_SADDR) {
-#ifdef CONNTRACK_LOCAL
-		old_sip = tuple->addr;
-		tuple->addr = new_sip = nat->address;
-#else
 		old_sip = tuple->saddr;
 		tuple->saddr = new_sip = nat->address;
-#endif
 	} else {
 		ret = skb_load_bytes(skb, l3_off + offsetof(struct iphdr, saddr), &old_sip, 4);
 		if (IS_ERR(ret))
@@ -489,7 +484,7 @@ static inline int __inline__ __lb4_rev_nat(struct __sk_buff *skb, int l3_off, in
 		if (IS_ERR(ret))
 			return ret;
 
-		cilium_trace_lb(skb, DBG_LB4_LOOPBACK_SNAT_REV, old_dip, old_sip);
+		cilium_dbg_lb(skb, DBG_LB4_LOOPBACK_SNAT_REV, old_dip, old_sip);
 
 		ret = skb_store_bytes(skb, l3_off + offsetof(struct iphdr, daddr), &old_sip, 4, 0);
 		if (IS_ERR(ret))
@@ -498,11 +493,7 @@ static inline int __inline__ __lb4_rev_nat(struct __sk_buff *skb, int l3_off, in
 		sum = csum_diff(&old_dip, 4, &old_sip, 4, 0);
 
 		/* Update the tuple address which is representing the destination address */
-#ifdef CONNTRACK_LOCAL
-		tuple->addr = old_sip;
-#else
 		tuple->saddr = old_sip;
-#endif
 	}
 
         ret = skb_store_bytes(skb, l3_off + offsetof(struct iphdr, saddr), &new_sip, 4, 0);
@@ -537,7 +528,7 @@ static inline int __inline__ lb4_rev_nat(struct __sk_buff *skb, int l3_off, int 
 {
 	struct lb4_reverse_nat *nat;
 
-	cilium_trace_lb(skb, DBG_LB4_REVERSE_NAT_LOOKUP, ct_state->rev_nat_index, 0);
+	cilium_dbg_lb(skb, DBG_LB4_REVERSE_NAT_LOOKUP, ct_state->rev_nat_index, 0);
 	nat = map_lookup_elem(&cilium_lb4_reverse_nat, &ct_state->rev_nat_index);
 	if (nat == NULL)
 		return 0;
@@ -562,11 +553,7 @@ static inline int __inline__ lb4_extract_key(struct __sk_buff *skb, struct ipv4_
 					     int l4_off, struct lb4_key *key,
 					     struct csum_offset *csum_off, int dir)
 {
-#ifdef CONNTRACK_LOCAL
-	key->address = tuple->addr;
-#else
 	key->address = (dir == CT_INGRESS) ? tuple->saddr : tuple->daddr;
-#endif
 	csum_l4_offset_and_flags(tuple->nexthdr, csum_off);
 
 #ifdef LB_L4
@@ -584,7 +571,7 @@ static inline struct lb4_service *lb4_lookup_service(struct __sk_buff *skb,
 		struct lb4_service *svc;
 
 		/* FIXME: The verifier barks on these calls right now for some reason */
-		/* cilium_trace_lb(skb, DBG_LB4_LOOKUP_MASTER, key->address, key->dport); */
+		/* cilium_dbg_lb(skb, DBG_LB4_LOOKUP_MASTER, key->address, key->dport); */
 		svc = map_lookup_elem(&cilium_lb4_services, key);
 		if (svc && svc->count != 0)
 			return svc;
@@ -598,14 +585,14 @@ static inline struct lb4_service *lb4_lookup_service(struct __sk_buff *skb,
 		struct lb4_service *svc;
 
 		/* FIXME: The verifier barks on these calls right now for some reason */
-		/* cilium_trace_lb(skb, DBG_LB4_LOOKUP_MASTER, key->address, key->dport); */
+		/* cilium_dbg_lb(skb, DBG_LB4_LOOKUP_MASTER, key->address, key->dport); */
 		svc = map_lookup_elem(&cilium_lb4_services, key);
 		if (svc && svc->count != 0)
 			return svc;
 	}
 #endif
 
-	cilium_trace_lb(skb, DBG_LB4_LOOKUP_MASTER_FAIL, 0, 0);
+	cilium_dbg_lb(skb, DBG_LB4_LOOKUP_MASTER_FAIL, 0, 0);
 	return NULL;
 }
 
@@ -615,10 +602,10 @@ static inline struct lb4_service *lb4_lookup_slave(struct __sk_buff *skb,
 	struct lb4_service *svc;
 
 	key->slave = slave;
-	cilium_trace_lb(skb, DBG_LB4_LOOKUP_SLAVE, key->slave, key->dport);
+	cilium_dbg_lb(skb, DBG_LB4_LOOKUP_SLAVE, key->slave, key->dport);
 	svc = map_lookup_elem(&cilium_lb4_services, key);
 	if (svc != NULL) {
-		cilium_trace_lb(skb, DBG_LB4_LOOKUP_SLAVE_SUCCESS, svc->target, svc->port);
+		cilium_dbg_lb(skb, DBG_LB4_LOOKUP_SLAVE_SUCCESS, svc->target, svc->port);
 		return svc;
 	}
 
@@ -641,7 +628,7 @@ lb4_xlate(struct __sk_buff *skb, __be32 *new_daddr, __be32 *new_saddr,
 	sum = csum_diff(&key->address, 4, new_daddr, 4, 0);
 
 	if (new_saddr && *new_saddr) {
-		cilium_trace_lb(skb, DBG_LB4_LOOPBACK_SNAT, *old_saddr, *new_saddr);
+		cilium_dbg_lb(skb, DBG_LB4_LOOPBACK_SNAT, *old_saddr, *new_saddr);
 		ret = skb_store_bytes(skb, l3_off + offsetof(struct iphdr, saddr), new_saddr, 4, 0);
 		if (ret < 0)
 			return DROP_WRITE_ERROR;
@@ -660,7 +647,7 @@ lb4_xlate(struct __sk_buff *skb, __be32 *new_daddr, __be32 *new_saddr,
 #ifdef LB_L4
 	if (svc->port && key->dport != svc->port &&
 	    (nexthdr == IPPROTO_TCP || nexthdr == IPPROTO_UDP)) {
-		__u16 tmp = svc->port;
+		__be16 tmp = svc->port;
 		/* Port offsets for UDP and TCP are the same */
 		ret = l4_modify_port(skb, l4_off, TCP_DPORT_OFF, csum_off, tmp, key->dport);
 		if (IS_ERR(ret))
@@ -699,16 +686,12 @@ static inline int __inline__ lb4_local(struct __sk_buff *skb, int l3_off, int l4
 		new_saddr = IPV4_LOOPBACK;
 		state->loopback = 1;
 		state->addr = new_saddr;
+		state->svc_addr = saddr;
 	}
 #endif
 
-	if (!state->loopback) {
-#ifdef CONNTRACK_LOCAL
-		tuple->addr = svc->target;
-#else
+	if (!state->loopback)
 		tuple->daddr = svc->target;
-#endif
-	}
 
 	return lb4_xlate(skb, &new_daddr, &new_saddr, &saddr,
 			 tuple->nexthdr, l3_off, l4_off, csum_off, key,

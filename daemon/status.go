@@ -16,42 +16,60 @@ package main
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/cilium/cilium/api/v1/models"
 	. "github.com/cilium/cilium/api/v1/server/restapi/daemon"
+	"github.com/cilium/cilium/pkg/controller"
+	"github.com/cilium/cilium/pkg/k8s"
+	"github.com/cilium/cilium/pkg/kvstore"
+	"github.com/cilium/cilium/pkg/node"
+	"github.com/cilium/cilium/pkg/option"
+	"github.com/cilium/cilium/pkg/workloads/containerd"
 
 	"github.com/go-openapi/runtime/middleware"
-	ctx "golang.org/x/net/context"
+	k8sTypes "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	k8sTypes "k8s.io/client-go/pkg/api/v1"
 )
 
-func (d *Daemon) getK8sStatus() *models.Status {
-	var k8sStatus *models.Status
-	if d.conf.IsK8sEnabled() {
-		if v, err := d.k8sClient.ComponentStatuses().Get("controller-manager", metav1.GetOptions{}); err != nil {
-			k8sStatus = &models.Status{State: models.StatusStateFailure, Msg: err.Error()}
-		} else if len(v.Conditions) == 0 {
-			k8sStatus = &models.Status{
-				State: models.StatusStateWarning,
-				Msg:   "Unable to retrieve controller-manager's kubernetes status",
-			}
-		} else {
-			if v.Conditions[0].Status == k8sTypes.ConditionTrue {
-				k8sStatus = &models.Status{
-					State: models.StatusStateOk,
-					Msg:   "OK",
-				}
-			} else {
-				k8sStatus = &models.Status{
-					State: models.StatusStateFailure,
-					Msg:   v.Conditions[0].Message,
-				}
-			}
-		}
-	} else {
-		k8sStatus = &models.Status{State: models.StatusStateDisabled}
+const (
+	collectStatusInterval = 5 * time.Second
+)
+
+func (d *Daemon) getK8sStatus() *models.K8sStatus {
+	if !k8s.IsEnabled() {
+		return &models.K8sStatus{State: models.StatusStateDisabled}
+
 	}
+
+	var (
+		k8sStatus *models.K8sStatus
+		status    *k8sTypes.ComponentStatus
+		err       error
+	)
+	if status, err = k8s.Client().CoreV1().ComponentStatuses().Get("controller-manager", metav1.GetOptions{}); err != nil {
+		return &models.K8sStatus{State: models.StatusStateFailure, Msg: err.Error()}
+	}
+	switch {
+	case len(status.Conditions) == 0:
+		k8sStatus = &models.K8sStatus{
+			State: models.StatusStateWarning,
+			Msg:   "Unable to retrieve controller-manager's kubernetes status",
+		}
+	case status.Conditions[0].Status == k8sTypes.ConditionTrue:
+		k8sStatus = &models.K8sStatus{
+			State: models.StatusStateOk,
+			Msg:   "OK",
+		}
+	default:
+		k8sStatus = &models.K8sStatus{
+			State: models.StatusStateFailure,
+			Msg:   status.Conditions[0].Message,
+		}
+	}
+
+	k8sStatus.K8sAPIVersions = d.k8sAPIGroups.getGroups()
+
 	return k8sStatus
 }
 
@@ -63,21 +81,68 @@ func NewGetHealthzHandler(d *Daemon) GetHealthzHandler {
 	return &getHealthz{daemon: d}
 }
 
+func checkLocks(d *Daemon) {
+	// Try to acquire a couple of global locks to have the status API fail
+	// in case of a deadlock on these locks
+
+	option.Config.ConfigPatchMutex.Lock()
+	option.Config.ConfigPatchMutex.Unlock()
+
+	d.GetCompilationLock().Lock()
+	d.GetCompilationLock().Unlock()
+}
+
+func (d *Daemon) getNodeStatus() *models.ClusterStatus {
+	ipv4 := !option.Config.IPv4Disabled
+
+	local, _ := node.GetLocalNode()
+	clusterStatus := models.ClusterStatus{
+		Self: local.Name,
+	}
+	for _, node := range node.GetNodes() {
+		clusterStatus.Nodes = append(clusterStatus.Nodes, node.GetModel(ipv4))
+	}
+	return &clusterStatus
+}
+
+func (d *Daemon) collectStatus() {
+	for {
+		response := d.getStatus()
+
+		d.statusCollectMutex.Lock()
+		d.statusResponse = response
+		d.statusCollectMutex.Unlock()
+
+		time.Sleep(collectStatusInterval)
+	}
+}
+
+func (d *Daemon) startStatusCollector() {
+	go d.collectStatus()
+}
+
 func (h *getHealthz) Handle(params GetHealthzParams) middleware.Responder {
 	d := h.daemon
-	sr := models.StatusResponse{}
+	d.statusCollectMutex.RLock()
+	sr := d.statusResponse
+	d.statusCollectMutex.RUnlock()
+	return NewGetHealthzOK().WithPayload(&sr)
+}
 
-	if info, err := d.kvClient.Status(); err != nil {
+func (d *Daemon) getStatus() models.StatusResponse {
+	sr := models.StatusResponse{
+		Controllers: controller.GetGlobalStatus(),
+	}
+
+	checkLocks(d)
+
+	if info, err := kvstore.Client().Status(); err != nil {
 		sr.Kvstore = &models.Status{State: models.StatusStateFailure, Msg: fmt.Sprintf("Err: %s - %s", err, info)}
 	} else {
 		sr.Kvstore = &models.Status{State: models.StatusStateOk, Msg: info}
 	}
 
-	if _, err := d.dockerClient.Info(ctx.Background()); err != nil {
-		sr.ContainerRuntime = &models.Status{State: models.StatusStateFailure, Msg: err.Error()}
-	} else {
-		sr.ContainerRuntime = &models.Status{State: models.StatusStateOk, Msg: ""}
-	}
+	sr.ContainerRuntime = containerd.Status()
 
 	sr.Kubernetes = d.getK8sStatus()
 
@@ -91,7 +156,7 @@ func (h *getHealthz) Handle(params GetHealthzParams) middleware.Responder {
 			State: sr.ContainerRuntime.State,
 			Msg:   "Container runtime is not ready",
 		}
-	} else if d.conf.IsK8sEnabled() && sr.Kubernetes.State != models.StatusStateOk {
+	} else if k8s.IsEnabled() && sr.Kubernetes.State != models.StatusStateOk {
 		sr.Cilium = &models.Status{
 			State: sr.Kubernetes.State,
 			Msg:   "Kubernetes service is not ready",
@@ -100,7 +165,21 @@ func (h *getHealthz) Handle(params GetHealthzParams) middleware.Responder {
 		sr.Cilium = &models.Status{State: models.StatusStateOk, Msg: "OK"}
 	}
 
-	sr.IPAM = d.DumpIPAM()
+	if d.DebugEnabled() {
+		sr.IPAM = d.DumpIPAM()
+	}
 
-	return NewGetHealthzOK().WithPayload(&sr)
+	sr.NodeMonitor = d.nodeMonitor.State()
+
+	sr.Cluster = d.getNodeStatus()
+
+	if d.ciliumHealth != nil {
+		sr.Cluster.CiliumHealth = d.ciliumHealth.GetStatus()
+	}
+
+	if d.l7Proxy != nil {
+		sr.Proxy = d.l7Proxy.GetStatusModel()
+	}
+
+	return sr
 }

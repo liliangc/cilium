@@ -3,9 +3,15 @@
 *.a
 *.so
 
+# LLVM IR files
+*.ll
+
 # Folders
 _obj
 _test
+tests/cilium-files
+test/test_results
+_build/
 
 # Architecture specific extensions/prefixes
 *.cgo1.go
@@ -20,6 +26,7 @@ _testmain.go
 *.test
 *.prof
 
+*.swn
 *.swp
 .vagrant
 coverage.out
@@ -29,3 +36,45 @@ coverage-all.html
 .DS_Store
 .idea/
 *.plist
+
+daemon/bindata.go
+
+cilium/bash_autocomplete
+*.swo
+outgoing
+
+*cscope.files
+*cscope.out
+*cscope.in.out
+*cscope.po.out
+*tags
+
+man/
+
+# Bazel symlinks
+bazel-*
+envoy/istio-envoy
+envoy/Dockerfile.istio_proxy
+envoy/Dockerfile.istio_proxy_debug
+
+test/tmp.yaml
+test/*_service_manifest.json
+test/*_manifest.yaml
+test/*_policy.json
+test/*.xml
+
+# Emacs backup files
+*~
+
+# Automatically generated when needed
+.dockerignore
+
+# Temporary files that allow build containers/VMs work without git
+GIT_VERSION
+envoy/SOURCE_VERSION
+envoy/Dockerfile.builder
+
+# To run Envoy tests under gdb do "cd envoy && make debug && ln -s bazel-envoy/external external"
+envoy/external
+
+test/bpf/_results

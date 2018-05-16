@@ -16,8 +16,11 @@ package cmd
 
 import (
 	"fmt"
+	"os"
 
+	"github.com/cilium/cilium/common"
 	"github.com/cilium/cilium/pkg/bpf"
+	"github.com/cilium/cilium/pkg/command"
 	"github.com/cilium/cilium/pkg/maps/ctmap"
 
 	"github.com/spf13/cobra"
@@ -25,37 +28,48 @@ import (
 
 // bpfCtListCmd represents the bpf_ct_list command
 var bpfCtListCmd = &cobra.Command{
-	Use:    "list",
-	Short:  "List connection tracking entries",
-	PreRun: requireEndpointIDorGlobal,
+	Use:     "list ( <endpoint identifier> | global )",
+	Aliases: []string{"ls"},
+	Short:   "List connection tracking entries",
+	PreRun:  requireEndpointIDorGlobal,
 	Run: func(cmd *cobra.Command, args []string) {
+		common.RequireRootPrivilege("cilium bpf ct list")
 		if args[0] == "global" {
-			dumpCtProto(ctmap.MapName6+args[0], ctmap.CtTypeIPv6Global)
-			dumpCtProto(ctmap.MapName4+args[0], ctmap.CtTypeIPv4Global)
+			dumpCtProto(ctmap.MapName6Global, "")
+			dumpCtProto(ctmap.MapName4Global, "")
 		} else {
-			dumpCtProto(ctmap.MapName6+args[0], ctmap.CtTypeIPv6)
-			dumpCtProto(ctmap.MapName4+args[0], ctmap.CtTypeIPv4)
+			dumpCtProto(ctmap.MapName6, args[0])
+			dumpCtProto(ctmap.MapName4, args[0])
 		}
 	},
 }
 
 func init() {
 	bpfCtCmd.AddCommand(bpfCtListCmd)
+	command.AddJSONOutput(bpfCtListCmd)
 }
 
-func dumpCtProto(name string, ctType ctmap.CtType) {
-	file := bpf.MapPath(name)
+func dumpCtProto(mapType, eID string) {
 
-	fd, err := bpf.ObjGet(file)
+	file := bpf.MapPath(mapType + eID)
+	m, err := bpf.OpenMap(file)
 	if err != nil {
-		Fatalf("Unable to open %s: %s\n", file, err)
+		if err == os.ErrNotExist {
+			Fatalf("Unable to open %s: %s: please try using \"cilium bpf ct list global\"", file, err)
+		} else {
+			Fatalf("Unable to open %s: %s", file, err)
+		}
 	}
-
-	m := ctmap.CtMap{Fd: fd, Type: ctType}
-	out, err := m.Dump()
-	if err != nil {
-		Fatalf("Error while dumping BPF Map: %s\n", err)
+	defer m.Close()
+	if command.OutputJSON() {
+		if err := command.PrintOutput(m); err != nil {
+			os.Exit(1)
+		}
+	} else {
+		out, err := ctmap.ToString(m, mapType)
+		if err != nil {
+			Fatalf("Error while dumping BPF Map: %s", err)
+		}
+		fmt.Println(out)
 	}
-
-	fmt.Println(out)
 }

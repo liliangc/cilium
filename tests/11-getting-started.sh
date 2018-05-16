@@ -1,109 +1,142 @@
 #!/bin/bash
-set -e
 
-source "./helpers.bash"
+dir=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
+source "${dir}/helpers.bash"
+# dir might have been overwritten by helpers.bash
+dir=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
 
-TEST_NET="cilium-net"
+TEST_NAME=$(get_filename_without_extension $0)
+LOGS_DIR="${dir}/cilium-files/${TEST_NAME}/logs"
+redirect_debug_logs ${LOGS_DIR}
+
+set -ex
+
+log "${TEST_NAME} has been deprecated and replaced by /test/runtime/Policies.go:L3/L4 Checks, L7 Checks"
+exit 0
+
+
 DEMO_CONTAINER="cilium/demo-client"
 HTTPD_CONTAINER_NAME="service1-instance1"
 ID_SERVICE1="id.service1"
 ID_SERVICE2="id.service2"
 
 function cleanup {
+  log "beginning cleanup for ${TEST_NAME}"
+  log "deleting all policies"
+  cilium policy delete --all 2> /dev/null || true
+  log "removing container ${HTTPD_CONTAINER_NAME}"
   docker rm -f ${HTTPD_CONTAINER_NAME}  2> /dev/null || true
-  docker network rm ${TEST_NET} 2> /dev/null || true
+  log "removing Docker network ${TEST_NET}"
+  remove_cilium_docker_network
   monitor_stop
+  log "finished cleanup for ${TEST_NAME}"
 }
 
-trap cleanup EXIT
+function finish_test {
+  log "finishing up ${TEST_NAME}"
+  gather_files ${TEST_NAME} ${TEST_SUITE}
+  cleanup
+  log "done finishing up ${TEST_NAME}"
+}
+
+trap finish_test EXIT
 
 cleanup
 monitor_start
 logs_clear
 
-echo "------ checking cilium status ------"
+log "checking cilium status"
 cilium status
 
-echo "------ creating Docker network of type Cilium ------"
-docker network create --ipv6 --subnet ::1/112 --driver cilium --ipam-driver cilium ${TEST_NET}
+create_cilium_docker_network
 
-echo "------ starting example service with Docker ------"
+log "starting example service with Docker"
 docker run -d --name ${HTTPD_CONTAINER_NAME} --net ${TEST_NET} -l "${ID_SERVICE1}" cilium/demo-httpd
 
-echo "------ creating l3_l4_policy.json ------"
-cat <<EOF | cilium policy import -
-{
-    "name": "root",
-    "rules": [{
-        "coverage": ["${ID_SERVICE1}"],
-        "allow": ["${ID_SERVICE2}"]
-    },{
-        "coverage": ["${ID_SERVICE1}"],
-        "l4": [{
-            "in-ports": [{ "port": 80, "protocol": "tcp" }]
-        }]
+log "importing l3_l4_policy.json"
+cat <<EOF | policy_import_and_wait -
+[{
+    "endpointSelector": {"matchLabels":{"${ID_SERVICE1}":""}},
+    "ingress": [{
+        "fromEndpoints": [
+	    {"matchLabels":{"${ID_SERVICE2}":""}}
+	],
+	"toPorts": [{
+	    "ports": [{"port": "80", "protocol": "tcp"}]
+	}]
     }]
-}
+}]
 EOF
 
 monitor_clear
-echo "------ pinging service1 from service2 ------"
-docker run --rm -i --net ${TEST_NET} -l "${ID_SERVICE2}" --cap-add NET_ADMIN ${DEMO_CONTAINER} ping -c 5 ${HTTPD_CONTAINER_NAME}  || {
-  abort "Error: Could not ping ${HTTPD_CONTAINER_NAME} from service2"
-}
-
-monitor_clear
-echo "------ pinging service1 from service3 ------"
-docker run --rm -i --net ${TEST_NET} -l "id.service3" --cap-add NET_ADMIN ${DEMO_CONTAINER} ping -c 5 ${HTTPD_CONTAINER_NAME} && {
+log "pinging service1 from service3"
+docker run --rm -i --net ${TEST_NET} -l "id.service3" --cap-add NET_ADMIN ${DEMO_CONTAINER} ping -c 10 ${HTTPD_CONTAINER_NAME} && {
   abort "Error: Unexpected success pinging ${HTTPD_CONTAINER_NAME} from service3"
 }
 
 monitor_clear
-echo "------ performing HTTP GET on ${HTTPD_CONTAINER_NAME}/public from service2 ------"
-docker run --rm -i --net ${TEST_NET} -l "${ID_SERVICE2}" ${DEMO_CONTAINER} curl -si "http://${HTTPD_CONTAINER_NAME}/public" || {
-  abort "Error: Could not reach ${HTTPD_CONTAINER_NAME}/public on port 80"
+log "pinging service1 from service2"
+docker run --rm -i --net ${TEST_NET} -l "${ID_SERVICE2}" --cap-add NET_ADMIN ${DEMO_CONTAINER} ping -c 10 ${HTTPD_CONTAINER_NAME} && {
+  abort "Error: Unexpected success pinging ${HTTPD_CONTAINER_NAME} from service2"
 }
 
 monitor_clear
-echo "------ performing HTTP GET on ${HTTPD_CONTAINER_NAME}/private from service2 ------"
-docker run --rm -i --net ${TEST_NET} -l "${ID_SERVICE2}" ${DEMO_CONTAINER} curl -si "http://${HTTPD_CONTAINER_NAME}/private" || {
-  abort "Error: Could not reach ${HTTPD_CONTAINER_NAME}/private on port 80"
-}
+log "performing HTTP GET on ${HTTPD_CONTAINER_NAME}/public from service2 (expected: 200)"
+RETURN=$(docker run --rm -i --net ${TEST_NET} -l "${ID_SERVICE2}" ${DEMO_CONTAINER} /bin/bash -c "curl -s --output /dev/stderr -w '%{http_code}' -XGET http://${HTTPD_CONTAINER_NAME}/public")
+if [[ "${RETURN//$'\n'}" != "200" ]]; then
+  abort "Error: Could not reach ${HTTPD_CONTAINER_NAME}/public on port 80"
+fi
 
-echo "------ creating l7_aware_policy.json ------"
-cat <<EOF | cilium policy import -
-{
-  "name": "root",
-  "rules": [{
-      "coverage": ["${ID_SERVICE1}"],
-      "allow": ["${ID_SERVICE2}", "reserved:host"]
-  },{
-      "coverage": ["${ID_SERVICE2}"],
-      "l4": [{
-          "out-ports": [{
-              "port": 80, "protocol": "tcp",
-              "l7-parser": "http",
-              "l7-rules": [
-                  { "expr": "Method(\"GET\") && Path(\"/public\")" }
-              ]
-          }]
-      }]
-  }]
-} 
+monitor_clear
+log "performing HTTP GET on ${HTTPD_CONTAINER_NAME}/private from service2 (expected: 200)"
+RETURN=$(docker run --rm -i --net ${TEST_NET} -l "${ID_SERVICE2}" ${DEMO_CONTAINER} /bin/bash -c "curl -s --output /dev/stderr -w '%{http_code}' -XGET http://${HTTPD_CONTAINER_NAME}/private")
+if [[ "${RETURN//$'\n'}" != "200" ]]; then
+  abort "Error: Could not reach ${HTTPD_CONTAINER_NAME}/private on port 80"
+fi
+
+log "importing l7_aware_policy.json"
+cilium policy delete --all
+cat <<EOF | policy_import_and_wait -
+[{
+    "endpointSelector": {"matchLabels":{"${ID_SERVICE1}":""}},
+    "ingress": [{
+        "fromEndpoints": [
+	    {"matchLabels":{"${ID_SERVICE2}":""}},
+	    {"matchLabels":{"reserved:host":""}}
+	]
+    }]
+},{
+    "endpointSelector": {"matchLabels":{"${ID_SERVICE2}":""}},
+    "egress": [{
+	"toPorts": [{
+	    "ports": [{"port": "80", "protocol": "tcp"}],
+	    "rules": {
+                "HTTP": [{
+		    "method": "GET",
+		    "path": "/public"
+                }]
+	    }
+	}]
+    }]
+}]
 EOF
 
 monitor_clear
-echo "------ performing HTTP GET on ${HTTPD_CONTAINER_NAME}/public from service2 ------"
-docker run --rm -i --net ${TEST_NET} -l "${ID_SERVICE2}" ${DEMO_CONTAINER} curl -si "http://${HTTPD_CONTAINER_NAME}/public" || {
+log "performing HTTP GET on ${HTTPD_CONTAINER_NAME}/public from service2 (expected: 200)"
+RETURN=$(docker run --rm -i --net ${TEST_NET} -l "${ID_SERVICE2}" ${DEMO_CONTAINER} /bin/bash -c "curl -s --output /dev/stderr -w '%{http_code}' -XGET http://${HTTPD_CONTAINER_NAME}/public")
+if [[ "${RETURN//$'\n'}" != "200" ]]; then
   abort "Error: Could not reach ${HTTPD_CONTAINER_NAME}/public on port 80"
-}
+fi
 
 monitor_clear
-echo "------ performing HTTP GET on ${HTTPD_CONTAINER_NAME}/private from service2 ------"
-docker run --rm -i --net ${TEST_NET} -l "${ID_SERVICE2}" ${DEMO_CONTAINER} /bin/bash -c "curl -si \"http://${HTTPD_CONTAINER_NAME}/private\" && false" && {
-  abort "Error: Unexpected success reaching ${HTTPD_CONTAINER_NAME}/private on port 80"
-}
+log "performing HTTP GET on ${HTTPD_CONTAINER_NAME}/private from service2 (expected: 403)"
+RETURN=$(docker run --rm -i --net ${TEST_NET} -l "${ID_SERVICE2}" ${DEMO_CONTAINER} /bin/bash -c "curl -s --output /dev/stderr -w '%{http_code}' --connect-timeout 15 -XGET http://${HTTPD_CONTAINER_NAME}/private")
+# FIXME: re-renable when redirect issue is resolved
+#if [[ "${RETURN//$'\n'}" != "403" ]]; then
+#  abort "Error: Unexpected success reaching ${HTTPD_CONTAINER_NAME}/private on port 80"
+#fi
 
+log "deleting all policies in Cilium"
+cilium policy delete --all
 
-cilium -D policy delete root
-
+test_succeeded "${TEST_NAME}"

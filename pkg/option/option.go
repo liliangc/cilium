@@ -18,16 +18,10 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"sync"
 
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/common"
-
-	"github.com/op/go-logging"
-)
-
-var (
-	log = logging.MustGetLogger("cilium-option")
+	"github.com/cilium/cilium/pkg/lock"
 )
 
 // VerifyFunc validates option key with value and may return an error if the
@@ -121,29 +115,35 @@ func (om OptionMap) DeepCopy() OptionMap {
 	return cpy
 }
 
+// BoolOptions member functions with external access do not require
+// locking by the caller, while functions with internal access presume
+// the caller to have taken care of any locking needed.
 type BoolOptions struct {
-	optsMU  sync.RWMutex   // Protects all variables from this structure below this line
+	optsMU  lock.RWMutex   // Protects all variables from this structure below this line
 	Opts    OptionMap      `json:"map"`
 	Library *OptionLibrary `json:"-"`
 }
 
-func (bo *BoolOptions) GetModel() *models.Configuration {
-	cfg := models.Configuration{
-		Immutable: make(models.ConfigurationMap),
-		Mutable:   make(models.ConfigurationMap),
-	}
+// GetImmutableModel returns the set of immutable options as a ConfigurationMap API model.
+func (bo *BoolOptions) GetImmutableModel() *models.ConfigurationMap {
+	immutableCfg := make(models.ConfigurationMap)
+	return &immutableCfg
+}
 
+// GetMutableModel returns the set of mutable options as a ConfigurationMap API model.
+func (bo *BoolOptions) GetMutableModel() *models.ConfigurationMap {
+	mutableCfg := make(models.ConfigurationMap)
 	bo.optsMU.RLock()
 	for k, v := range bo.Opts {
 		if v {
-			cfg.Mutable[k] = "Enabled"
+			mutableCfg[k] = "Enabled"
 		} else {
-			cfg.Mutable[k] = "Disabled"
+			mutableCfg[k] = "Disabled"
 		}
 	}
 	bo.optsMU.RUnlock()
 
-	return &cfg
+	return &mutableCfg
 }
 
 func (bo *BoolOptions) DeepCopy() *BoolOptions {
@@ -163,15 +163,15 @@ func NewBoolOptions(lib *OptionLibrary) *BoolOptions {
 	}
 }
 
-func (bo *BoolOptions) IsEnabled(key string) bool {
-	bo.optsMU.RLock()
+func (bo *BoolOptions) isEnabled(key string) bool {
 	set, exists := bo.Opts[key]
-	bo.optsMU.RUnlock()
 	return exists && set
 }
 
-func (bo *BoolOptions) IsDisabled(key string) bool {
-	return !bo.IsEnabled(key)
+func (bo *BoolOptions) IsEnabled(key string) bool {
+	bo.optsMU.RLock()
+	defer bo.optsMU.RUnlock()
+	return bo.isEnabled(key)
 }
 
 func (bo *BoolOptions) Set(key string, value bool) {
@@ -195,7 +195,9 @@ func (bo *BoolOptions) SetIfUnset(key string, value bool) {
 }
 
 func (bo *BoolOptions) InheritDefault(parent *BoolOptions, key string) {
-	bo.Set(key, parent.IsEnabled(key))
+	bo.optsMU.RLock()
+	bo.Opts[key] = parent.isEnabled(key)
+	bo.optsMU.RUnlock()
 }
 
 func ParseOption(arg string, lib *OptionLibrary) (string, bool, error) {
@@ -222,7 +224,7 @@ func ParseOption(arg string, lib *OptionLibrary) (string, bool, error) {
 
 	key, spec := lib.Lookup(arg)
 	if key == "" {
-		return "", false, fmt.Errorf("Unknown endpoint option %s", arg)
+		return "", false, fmt.Errorf("Unknown option %q", arg)
 	}
 
 	if spec.Immutable {
@@ -240,7 +242,7 @@ func (bo *BoolOptions) getFmtOpt(name string) string {
 		return ""
 	}
 
-	if bo.IsEnabled(name) {
+	if bo.isEnabled(name) {
 		return "#define " + bo.Library.Define(name)
 	}
 	return "#undef " + bo.Library.Define(name)
@@ -290,9 +292,17 @@ func (bo *BoolOptions) Validate(n models.ConfigurationMap) error {
 	bo.optsMU.RLock()
 	defer bo.optsMU.RUnlock()
 	for k, v := range n {
-		if val, err := NormalizeBool(v); err != nil {
+		newVal, err := NormalizeBool(v)
+		if err != nil {
 			return err
-		} else if err := bo.Library.Validate(k, val); err != nil {
+		}
+
+		// Ignore validation if value is identical
+		if oldVal, ok := bo.Opts[k]; ok && oldVal == newVal {
+			continue
+		}
+
+		if err := bo.Library.Validate(k, newVal); err != nil {
 			return err
 		}
 	}
@@ -333,11 +343,16 @@ func (bo *BoolOptions) disable(name string) {
 	}
 }
 
+type changedOptions struct {
+	key   string
+	value bool
+}
+
 // Apply takes a configuration map and applies the changes. For an option
 // which is changed, the `ChangedFunc` function is called with the `data`
 // argument passed in as well. Returns the number of options changed if any.
 func (bo *BoolOptions) Apply(n models.ConfigurationMap, changed ChangedFunc, data interface{}) int {
-	changes := 0
+	changes := []changedOptions{}
 
 	bo.optsMU.Lock()
 	for k, v := range n {
@@ -347,19 +362,21 @@ func (bo *BoolOptions) Apply(n models.ConfigurationMap, changed ChangedFunc, dat
 			/* Only enable if not enabled already */
 			if !ok || !val {
 				bo.enable(k)
-				changes++
-				changed(k, true, data)
+				changes = append(changes, changedOptions{key: k, value: true})
 			}
 		} else {
 			/* Only disable if enabled already */
 			if ok && val {
 				bo.disable(k)
-				changes++
-				changed(k, false, data)
+				changes = append(changes, changedOptions{key: k, value: false})
 			}
 		}
 	}
 	bo.optsMU.Unlock()
 
-	return changes
+	for _, change := range changes {
+		changed(change.key, change.value, data)
+	}
+
+	return len(changes)
 }

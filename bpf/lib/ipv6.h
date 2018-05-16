@@ -29,7 +29,7 @@
 #define IPV6_TCLASS_SHIFT       20
 
 /* Number of extension headers that can be skipped */
-#define IPV6_MAX_HEADERS 10
+#define IPV6_MAX_HEADERS 4
 
 #define NEXTHDR_HOP             0       /* Hop-by-hop option header. */
 #define NEXTHDR_TCP             6       /* TCP segment. */
@@ -120,6 +120,33 @@ static inline int ipv6_addrcmp(union v6addr *a, union v6addr *b)
 	}
 
 	return tmp;
+}
+
+// Only works with contiguous masks.
+static inline int ipv6_addr_in_net(union v6addr *addr, union v6addr *net, union v6addr *mask)
+{
+	return ((addr->p1 & mask->p1) == net->p1)
+		&& (!mask->p2
+		    || (((addr->p2 & mask->p2) == net->p2)
+			&& (!mask->p3
+			    || (((addr->p3 & mask->p3) == net->p3)
+				&& (!mask->p4 || ((addr->p4 & mask->p4) == net->p4))))));
+}
+
+#define GET_PREFIX(PREFIX)						\
+	bpf_htonl(prefix <= 0 ? 0 : prefix < 32 ? ((1<<prefix) - 1) << (32-prefix)	\
+			      : 0xFFFFFFFF)
+
+static inline void ipv6_addr_clear_suffix(union v6addr *addr, int prefix)
+{
+	addr->p1 &= GET_PREFIX(prefix);
+	prefix -= 32;
+	addr->p2 &= GET_PREFIX(prefix);
+	prefix -= 32;
+	addr->p3 &= GET_PREFIX(prefix);
+	prefix -= 32;
+	addr->p4 &= GET_PREFIX(prefix);
+	prefix -= 32;
 }
 
 static inline int ipv6_match_prefix_96(const union v6addr *addr, const union v6addr *prefix)
@@ -217,7 +244,7 @@ static inline int ipv6_store_paylen(struct __sk_buff *skb, int off, __be16 *len)
 
 static inline int ipv6_store_flowlabel(struct __sk_buff *skb, int off, __be32 label)
 {
-	__u32 old;
+	__be32 old;
 
 	/* use traffic class from packet */
 	if (skb_load_bytes(skb, off, &old, 4) < 0)
@@ -232,36 +259,12 @@ static inline int ipv6_store_flowlabel(struct __sk_buff *skb, int off, __be32 la
 	return 0;
 }
 
-static inline __u16 derive_lxc_id(union v6addr *addr)
-{
-	return bpf_ntohl(addr->p4) & 0xFFFF;
-}
-
-/* FIXME: rewrite this to avoid byte order conversion */
-static inline void ipv6_set_lxc_id(union v6addr *addr, __u16 lxc_id)
-{
-	__u32 p4 = bpf_ntohl(addr->p4);
-	p4 &= ~0xFFFF;
-	p4 |= lxc_id;
-	addr->p4 = bpf_htonl(p4);
-}
-
-static inline __u32 ipv6_derive_node_id(union v6addr *addr)
-{
-	return bpf_ntohl(addr->p3);
-}
-
-static inline void ipv6_set_node_id(union v6addr *addr, __u32 node_id)
-{
-	addr->p3 = bpf_htonl(node_id);
-}
-
 static inline __be32 ipv6_pseudohdr_checksum(struct ipv6hdr *hdr,
                                              __u8 next_hdr,
 					     __u16 payload_len, __be32 sum)
 {
-	__u32 len = bpf_htonl((__u32)payload_len);
-	__u32 nexthdr = bpf_htonl((__u32)next_hdr);
+	__be32 len = bpf_htonl((__u32)payload_len);
+	__be32 nexthdr = bpf_htonl((__u32)next_hdr);
 	sum = csum_diff(NULL, 0, &hdr->saddr, sizeof(struct in6_addr), sum);
 	sum = csum_diff(NULL, 0, &hdr->daddr, sizeof(struct in6_addr), sum);
 	sum = csum_diff(NULL, 0, &len, sizeof(len), sum);

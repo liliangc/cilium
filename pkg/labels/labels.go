@@ -1,4 +1,4 @@
-// Copyright 2016-2017 Authors of Cilium
+// Copyright 2016-2018 Authors of Cilium
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,110 +19,210 @@ import (
 	"crypto/sha512"
 	"encoding/json"
 	"fmt"
+	"net"
 	"sort"
 	"strings"
-	"sync"
 
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/common"
-
-	"github.com/op/go-logging"
-)
-
-var (
-	log = logging.MustGetLogger("cilium-labels")
 )
 
 const (
 	// IDNameAll is a special label which matches all labels.
 	IDNameAll = "all"
+
 	// IDNameHost is the label used for the hostname ID.
 	IDNameHost = "host"
+
 	// IDNameWorld is the label used for the world ID.
 	IDNameWorld = "world"
+
+	// IDNameCluster is the label used to identify an unspecified endpoint
+	// inside the cluster
+	IDNameCluster = "cluster"
+
+	// IDNameHealth is the label used for the local cilium-health endpoint
+	IDNameHealth = "health"
 )
 
 // OpLabels represents the the possible types.
+// +k8s:openapi-gen=false
 type OpLabels struct {
 	// Active labels that are enabled and disabled but not deleted
 	Custom Labels
 	// Labels derived from orchestration system
-	Orchestration Labels
-	// Orchestration labels which have been disabled
+	OrchestrationIdentity Labels
+
+	//OrchestrationIdentity
+	// OrchestrationIdentity labels which have been disabled
 	Disabled Labels
+
+	//OrchestrationInfo - labels from orchestration which are not used in determining a security identity
+	OrchestrationInfo Labels
 }
 
-// DeepCopy returns deep copy of the label.
-func (o *OpLabels) DeepCopy() *OpLabels {
-	return &OpLabels{
-		Custom:        o.Custom.DeepCopy(),
-		Disabled:      o.Disabled.DeepCopy(),
-		Orchestration: o.Orchestration.DeepCopy(),
-	}
-}
-
-// Enabled returns map of enabled labels.
-func (o *OpLabels) Enabled() Labels {
-	enabled := make(Labels, len(o.Custom)+len(o.Orchestration))
+// IdentityLabels returns map of labels that are used when determining a
+// security identity.
+func (o *OpLabels) IdentityLabels() Labels {
+	enabled := make(Labels, len(o.Custom)+len(o.OrchestrationIdentity))
 
 	for k, v := range o.Custom {
 		enabled[k] = v
 	}
 
-	for k, v := range o.Orchestration {
+	for k, v := range o.OrchestrationIdentity {
 		enabled[k] = v
 	}
 
 	return enabled
 }
 
+// AllLabels returns all Labels within the provided OpLabels.
+func (o *OpLabels) AllLabels() Labels {
+	all := make(Labels, len(o.Custom)+len(o.OrchestrationInfo)+len(o.OrchestrationIdentity)+len(o.Disabled))
+
+	for k, v := range o.Custom {
+		all[k] = v
+	}
+
+	for k, v := range o.Disabled {
+		all[k] = v
+	}
+
+	for k, v := range o.OrchestrationIdentity {
+		all[k] = v
+	}
+
+	for k, v := range o.OrchestrationInfo {
+		all[k] = v
+	}
+	return all
+}
+
 // NewOplabelsFromModel creates new label from the model.
-func NewOplabelsFromModel(base *models.LabelConfiguration) *OpLabels {
+func NewOplabelsFromModel(base *models.LabelConfigurationStatus) *OpLabels {
 	if base == nil {
 		return nil
 	}
 
 	return &OpLabels{
-		Custom:        NewLabelsFromModel(base.Custom),
-		Disabled:      NewLabelsFromModel(base.Disabled),
-		Orchestration: NewLabelsFromModel(base.OrchestrationSystem),
+		Custom:                NewLabelsFromModel(base.Realized.User),
+		Disabled:              NewLabelsFromModel(base.Disabled),
+		OrchestrationIdentity: NewLabelsFromModel(base.SecurityRelevant),
+		OrchestrationInfo:     NewLabelsFromModel(base.Derived),
 	}
 }
 
-// LabelOwner represents owner of the label.
-type LabelOwner interface {
-	ResolveName(name string) string
-}
+const (
+	// LabelSourceUnspec is a label with unspecified source
+	LabelSourceUnspec = "unspec"
+
+	// LabelSourceAny is a label that matches any source
+	LabelSourceAny = "any"
+
+	// LabelSourceK8s is a label imported from Kubernetes
+	LabelSourceK8s = "k8s"
+
+	// LabelSourceMesos is a label imported from Mesos
+	LabelSourceMesos = "mesos"
+
+	// LabelSourceK8sKeyPrefix is prefix of a Kubernetes label
+	LabelSourceK8sKeyPrefix = LabelSourceK8s + "."
+
+	// LabelSourceContainer is a label imported from the container runtime
+	LabelSourceContainer = "container"
+
+	// LabelSourceReserved is the label source for reserved types.
+	LabelSourceReserved = "reserved"
+
+	// LabelSourceCIDR is the label source for generated CIDRs.
+	LabelSourceCIDR = "cidr"
+
+	// LabelSourceReservedKeyPrefix is the prefix of a reserved label
+	LabelSourceReservedKeyPrefix = LabelSourceReserved + "."
+)
 
 // Label is the cilium's representation of a container label.
 type Label struct {
 	Key   string `json:"key"`
 	Value string `json:"value,omitempty"`
-	// Source can be on of the values present in const.go (e.g.: CiliumLabelSource)
-	Source   string       `json:"source"`
-	absKeyMU sync.RWMutex // absKeyMU protects the absKey variable
-	absKey   string
+	// Source can be one of the values present in const.go (e.g.: LabelSourceContainer)
+	Source string `json:"source"`
 	// Mark element to be used to find unused labels in lists
-	DeletionMark bool `json:"-"`
-	owner        LabelOwner
+	deletionMark bool
 }
 
 // Labels is a map of labels where the map's key is the same as the label's key.
 type Labels map[string]*Label
 
-// MarkAllForDeletion marks all the labels with the DeletionMark.
+// GetPrintableModel turns the Labels into a sorted list of strings
+// representing the labels, with CIDRs deduplicated (ie, only provide the most
+// specific CIDR).
+func (l Labels) GetPrintableModel() (res []string) {
+	cidr := ""
+	prefixLength := 0
+	for _, v := range l {
+		if v.Source == LabelSourceCIDR {
+			vStr := strings.Replace(v.String(), "-", ":", -1)
+			prefix := strings.Replace(v.Key, "-", ":", -1)
+			_, ipnet, _ := net.ParseCIDR(prefix)
+			ones, _ := ipnet.Mask.Size()
+			if ones > prefixLength {
+				cidr = vStr
+				prefixLength = ones
+			}
+			continue
+		}
+		res = append(res, v.String())
+	}
+	if cidr != "" {
+		res = append(res, cidr)
+	}
+
+	sort.Strings(res)
+	return res
+}
+
+// String returns the map of labels as human readable string
+func (l Labels) String() string {
+	return strings.Join(l.GetPrintableModel(), ",")
+}
+
+// MarkAllForDeletion marks all the labels with the deletionMark.
 func (l Labels) MarkAllForDeletion() {
 	for k := range l {
-		l[k].DeletionMark = true
+		l[k].deletionMark = true
 	}
 }
 
-// DeleteMarked deletes the labels which have the DeletionMark set and returns
+func (l *Label) ClearDeletionMark() {
+	l.deletionMark = false
+}
+
+// UpsertLabel updates or inserts 'label' in 'l', but only if exactly the same label
+// was not already in 'l'. If a label with the same key is found, the label's deletionMark
+// is cleared. Returns 'true' if a label was added, or an old label was updated, 'false'
+// otherwise.
+func (l Labels) UpsertLabel(label *Label) bool {
+	oldLabel := l[label.Key]
+	if oldLabel != nil {
+		l[label.Key].ClearDeletionMark()
+		// Key is the same, check if Value and Source are also the same
+		if label.Value == oldLabel.Value && label.Source == oldLabel.Source {
+			return false // No change
+		}
+	}
+	// Insert or replace old label
+	l[label.Key] = label.DeepCopy()
+	return true
+}
+
+// DeleteMarked deletes the labels which have the deletionMark set and returns
 // true if any of them were deleted.
 func (l Labels) DeleteMarked() bool {
 	deleted := false
 	for k := range l {
-		if l[k].DeletionMark {
+		if l[k].deletionMark {
 			delete(l, k)
 			deleted = true
 		}
@@ -136,21 +236,18 @@ func (l Labels) DeleteMarked() bool {
 func (l Labels) AppendPrefixInKey(prefix string) Labels {
 	newLabels := Labels{}
 	for k, v := range l {
-		v.absKeyMU.RLock()
 		newLabels[prefix+k] = &Label{
 			Key:    prefix + v.Key,
 			Value:  v.Value,
 			Source: v.Source,
-			absKey: v.absKey,
 		}
-		v.absKeyMU.RUnlock()
 	}
 	return newLabels
 }
 
 // NewLabel returns a new label from the given key, value and source. If source is empty,
-// the default value will be common.CiliumLabelSource. If key starts with '$', the source
-// will be overwritten with common.ReservedLabelSource. If key contains ':', the value
+// the default value will be LabelSourceUnspec. If key starts with '$', the source
+// will be overwritten with LabelSourceReserved. If key contains ':', the value
 // before ':' will be used as source if given source is empty, otherwise the value before
 // ':' will be deleted and unused.
 func NewLabel(key string, value string, source string) *Label {
@@ -158,12 +255,12 @@ func NewLabel(key string, value string, source string) *Label {
 	src, key = parseSource(key)
 	if source == "" {
 		if src == "" {
-			source = common.CiliumLabelSource
+			source = LabelSourceUnspec
 		} else {
 			source = src
 		}
 	}
-	if src == common.ReservedLabelSource && key == "" {
+	if src == LabelSourceReserved && key == "" {
 		key = value
 		value = ""
 	}
@@ -175,75 +272,29 @@ func NewLabel(key string, value string, source string) *Label {
 	}
 }
 
-// DeepCopy returns a Deep copy of the receiver's label.
-func (l *Label) DeepCopy() *Label {
-	ret := NewLabel(l.Key, l.Value, l.Source)
-	l.absKeyMU.RLock()
-	ret.absKey = l.absKey
-	l.absKeyMU.RUnlock()
-	ret.DeletionMark = l.DeletionMark
-	ret.owner = l.owner
-	return ret
-}
-
-// NewOwnedLabel returns a new label like NewLabel but also assigns an owner
-func NewOwnedLabel(key string, value string, source string, owner LabelOwner) *Label {
-	l := NewLabel(key, value, source)
-	l.SetOwner(owner)
-	return l
-}
-
-// SetOwner modifies the owner of a label
-func (l *Label) SetOwner(owner LabelOwner) {
-	l.owner = owner
-}
-
 // Equals returns true if source, AbsoluteKey() and Value are equal and false otherwise.
 func (l *Label) Equals(b *Label) bool {
-	return l.Source == b.Source &&
-		l.AbsoluteKey() == b.AbsoluteKey() &&
-		l.Value == b.Value
+	if !l.IsAnySource() {
+		if l.Source != b.Source {
+			return false
+		}
+	}
+	return l.Key == b.Key && l.Value == b.Value
 }
 
 // IsAllLabel returns true if the label is reserved and matches with IDNameAll.
 func (l *Label) IsAllLabel() bool {
-	return l.Source == common.ReservedLabelSource && l.Key == "all"
+	return l.Source == LabelSourceReserved && l.Key == "all"
 }
 
-// Matches returns true if it's a special label or the label equals the target.
+// IsAnySource return if the label was set with source "any".
+func (l *Label) IsAnySource() bool {
+	return l.Source == LabelSourceAny
+}
+
+// Matches returns true if l matches the target
 func (l *Label) Matches(target *Label) bool {
 	return l.IsAllLabel() || l.Equals(target)
-}
-
-// Resolve resolves the absolute key path for this Label from policyNode.
-func (l *Label) Resolve(owner LabelOwner) {
-	l.SetOwner(owner)
-
-	// Force generation of absolute key
-	absKey := l.AbsoluteKey()
-
-	log.Debugf("Resolved label %s to path %s\n", l.String(), absKey)
-}
-
-// AbsoluteKey if set returns the absolute key path, otherwise returns the label's Key.
-func (l *Label) AbsoluteKey() string {
-	l.absKeyMU.Lock()
-	defer l.absKeyMU.Unlock()
-	if l.absKey == "" {
-		// Never translate using an owner if a reserved label
-		if l.owner != nil && l.Source != common.ReservedLabelSource &&
-			!strings.HasPrefix(l.Key, common.K8sPodNamespaceLabel) {
-			l.absKey = l.owner.ResolveName(l.Key)
-		} else {
-			if !strings.HasPrefix(l.Key, "root.") {
-				l.absKey = "root." + l.Key
-			} else {
-				l.absKey = l.Key
-			}
-		}
-	}
-
-	return l.absKey
 }
 
 // String returns the string representation of Label in the for of Source:Key=Value or
@@ -309,6 +360,37 @@ func (l *Label) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// GetExtendedKey returns the key of a label with the source encoded.
+func (l *Label) GetExtendedKey() string {
+	return l.Source + common.PathDelimiter + l.Key
+}
+
+// GetCiliumKeyFrom returns the label's source and key from the an extended key
+// in the format SOURCE:KEY.
+func GetCiliumKeyFrom(extKey string) string {
+	sourceSplit := strings.SplitN(extKey, common.PathDelimiter, 2)
+	if len(sourceSplit) == 2 {
+		return sourceSplit[0] + ":" + sourceSplit[1]
+	}
+	return LabelSourceAny + ":" + sourceSplit[0]
+}
+
+// GetExtendedKeyFrom returns the extended key of a label string.
+// For example:
+// `k8s:foo=bar` returns `k8s.foo`
+// `container:foo=bar` returns `container.foo`
+// `foo=bar` returns `any.foo=bar`
+func GetExtendedKeyFrom(str string) string {
+	src, next := parseSource(str)
+	if src == "" {
+		src = LabelSourceAny
+	}
+	// Remove an eventually value
+	nextSplit := strings.SplitN(next, "=", 2)
+	next = nextSplit[0]
+	return src + common.PathDelimiter + next
+}
+
 // Map2Labels transforms in the form: map[key(string)]value(string) into Labels. The
 // source argument will overwrite the source written in the key of the given map.
 // Example:
@@ -326,37 +408,40 @@ func Map2Labels(m map[string]string, source string) Labels {
 
 // DeepCopy returns a deep copy of the labels.
 func (l Labels) DeepCopy() Labels {
-	o := Labels{}
+	if l == nil {
+		return nil
+	}
+
+	o := make(Labels, len(l))
 	for k, v := range l {
-		v.absKeyMU.RLock()
-		o[k] = &Label{
-			Key:    v.Key,
-			Value:  v.Value,
-			Source: v.Source,
-			absKey: v.absKey,
-		}
-		v.absKeyMU.RUnlock()
+		o[k] = v.DeepCopy()
 	}
 	return o
 }
 
 // NewLabelsFromModel creates labels from string array.
 func NewLabelsFromModel(base []string) Labels {
-	lbls := Labels{}
+	lbls := make(Labels, len(base))
 	for _, v := range base {
-		lbl := ParseLabel(v)
-		lbls[lbl.Key] = lbl
+		if lbl := ParseLabel(v); lbl.Key != "" {
+			lbls[lbl.Key] = lbl
+		}
 	}
 
 	return lbls
 }
 
-// NewLabelArrayFromModel creates labels from string array.
-func NewLabelArrayFromModel(base []string) LabelArray {
-	lbls := LabelArray{}
+// NewLabelsFromSortedList returns labels based on the output of SortedList()
+func NewLabelsFromSortedList(list string) Labels {
+	return NewLabelsFromModel(strings.Split(list, ";"))
+}
+
+// NewSelectLabelArrayFromModel parses a slice of strings and converts them
+// into an array of selecting labels.
+func NewSelectLabelArrayFromModel(base []string) LabelArray {
+	lbls := make(LabelArray, 0, len(base))
 	for _, v := range base {
-		lbl := ParseLabel(v)
-		lbls = append(lbls, lbl)
+		lbls = append(lbls, ParseSelectLabel(v))
 	}
 
 	return lbls
@@ -364,7 +449,7 @@ func NewLabelArrayFromModel(base []string) LabelArray {
 
 // GetModel returns model with all the values of the labels.
 func (l Labels) GetModel() []string {
-	res := []string{}
+	res := make([]string, 0, len(l))
 	for _, v := range l {
 		res = append(res, v.String())
 	}
@@ -389,10 +474,14 @@ func (l Labels) MergeLabels(from Labels) {
 // SHA256Sum calculates l' internal SHA256Sum. For a particular set of labels is
 // guarantee that it will always have the same SHA256Sum.
 func (l Labels) SHA256Sum() string {
-	return fmt.Sprintf("%x", sha512.New512_256().Sum(l.sortedList()))
+	return fmt.Sprintf("%x", sha512.Sum512_256(l.SortedList()))
 }
 
-func (l Labels) sortedList() []byte {
+// SortedList returns the labels as a sorted list, separated by semicolon
+//
+// DO NOT BREAK THE FORMAT OF THIS. THE RETURNED STRING IS USED AS KEY IN
+// THE KEY-VALUE STORE.
+func (l Labels) SortedList() []byte {
 	var keys []string
 	for k := range l {
 		keys = append(keys, k)
@@ -403,7 +492,7 @@ func (l Labels) sortedList() []byte {
 	for _, k := range keys {
 		// We don't care if the values already have a '=' since this method is
 		// only used to calculate a SHA256Sum
-		result += fmt.Sprintf(`%s=%s;`, k, l[k].Value)
+		result += fmt.Sprintf(`%s:%s=%s;`, l[k].Source, k, l[k].Value)
 	}
 
 	return []byte(result)
@@ -418,6 +507,28 @@ func (l Labels) ToSlice() []*Label {
 	return labels
 }
 
+// LabelArray returns the labels as label array
+func (l Labels) LabelArray() LabelArray {
+	return l.ToSlice()
+}
+
+// FindReserved locates all labels with reserved source in the labels and
+// returns a copy of them. If there are no reserved labels, returns nil.
+func (l Labels) FindReserved() Labels {
+	lbls := Labels{}
+
+	for k, lbl := range l {
+		if lbl.Source == LabelSourceReserved {
+			lbls[k] = lbl.DeepCopy()
+		}
+	}
+
+	if len(lbls) > 0 {
+		return lbls
+	}
+	return nil
+}
+
 // parseSource returns the parsed source of the given str. It also returns the next piece
 // of text that is after the source.
 // Example:
@@ -429,14 +540,14 @@ func parseSource(str string) (src, next string) {
 		return "", ""
 	}
 	if str[0] == '$' {
-		str = strings.Replace(str, "$", common.ReservedLabelSource+":", 1)
+		str = strings.Replace(str, "$", LabelSourceReserved+":", 1)
 	}
 	sourceSplit := strings.SplitN(str, ":", 2)
 	if len(sourceSplit) != 2 {
 		next = sourceSplit[0]
-		if strings.HasPrefix(next, common.ReservedLabelKey) {
-			src = common.ReservedLabelSource
-			next = strings.TrimPrefix(next, common.ReservedLabelKey)
+		if strings.HasPrefix(next, LabelSourceReserved) {
+			src = LabelSourceReserved
+			next = strings.TrimPrefix(next, LabelSourceReservedKeyPrefix)
 		}
 	} else {
 		if sourceSplit[0] != "" {
@@ -456,13 +567,13 @@ func ParseLabel(str string) *Label {
 	if src != "" {
 		lbl.Source = src
 	} else {
-		lbl.Source = common.CiliumLabelSource
+		lbl.Source = LabelSourceUnspec
 	}
 
 	keySplit := strings.SplitN(next, "=", 2)
 	lbl.Key = keySplit[0]
 	if len(keySplit) > 1 {
-		if src == common.ReservedLabelSource && keySplit[0] == "" {
+		if src == LabelSourceReserved && keySplit[0] == "" {
 			lbl.Key = keySplit[1]
 		} else {
 			lbl.Value = keySplit[1]
@@ -471,22 +582,27 @@ func ParseLabel(str string) *Label {
 	return &lbl
 }
 
-// ParseStringLabels returns label representations from strings.
-func ParseStringLabels(strLbls []string) Labels {
-	lbls := Labels{}
-	for _, l := range strLbls {
-		lbl := ParseLabel(l)
-		lbls[lbl.Key] = lbl
+// ParseSelectLabel returns a selecting label representation of the given
+// string. Unlike ParseLabel, if source is unspecified, the source defaults to
+// LabelSourceAny
+func ParseSelectLabel(str string) *Label {
+	lbl := ParseLabel(str)
+
+	if lbl.Source == LabelSourceUnspec {
+		lbl.Source = LabelSourceAny
 	}
 
-	return lbls
+	return lbl
 }
 
-// LabelSliceSHA256Sum returns SHA256 checksum from the labels.
-func LabelSliceSHA256Sum(labels []*Label) (string, error) {
-	sha := sha512.New512_256()
-	if err := json.NewEncoder(sha).Encode(labels); err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("%x", sha.Sum(nil)), nil
+// generateLabelString generates the string representation of a label with
+// the provided source, key, and value in the format "source:key=value".
+func generateLabelString(source, key, value string) string {
+	return fmt.Sprintf("%s:%s=%s", source, key, value)
+}
+
+// GenerateK8sLabelString generates the string representation of a label with
+// the provided source, key, and value in the format "LabelSourceK8s:key=value".
+func GenerateK8sLabelString(k, v string) string {
+	return generateLabelString(LabelSourceK8s, k, v)
 }

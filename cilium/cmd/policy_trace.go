@@ -16,55 +16,172 @@ package cmd
 
 import (
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 
 	. "github.com/cilium/cilium/api/v1/client/policy"
 	"github.com/cilium/cilium/api/v1/models"
-	"github.com/cilium/cilium/pkg/labels"
+	"github.com/cilium/cilium/common"
+	"github.com/cilium/cilium/pkg/command"
+	"github.com/cilium/cilium/pkg/endpoint"
+	"github.com/cilium/cilium/pkg/identity"
+	"github.com/cilium/cilium/pkg/k8s"
+	"github.com/cilium/cilium/pkg/policy/trace"
 
 	"github.com/spf13/cobra"
+	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+const (
+	defaultSecurityID = -1
+)
+
+type supportedKinds string
+
 var src, dst, dports []string
+var srcIdentity, dstIdentity int64
+var srcEndpoint, dstEndpoint, srcK8sPod, dstK8sPod, srcK8sYaml, dstK8sYaml string
 
 // policyTraceCmd represents the policy_trace command
 var policyTraceCmd = &cobra.Command{
-	Use:   "trace -s <context> -d <context> [--dport <port>[/<protocol>]",
+	Use:   "trace ( -s <label context> | --src-identity <security identity> | --src-endpoint <endpoint ID> | --src-k8s-pod <namespace:pod-name> | --src-k8s-yaml <path to YAML file> ) ( -d <label context> | --dst-identity <security identity> | --dst-endpoint <endpoint ID> | --dst-k8s-pod <namespace:pod-name> | --dst-k8s-yaml <path to YAML file>) [--dport <port>[/<protocol>]",
 	Short: "Trace a policy decision",
-	Long: `Verifies if source ID or LABEL(s) is allowed to consume
-destination ID or LABEL(s). LABEL is represented as
+	Long: `Verifies if the source is allowed to consume
+destination. Source / destination can be provided as endpoint ID, security ID, Kubernetes Pod, YAML file, set of LABELs. LABEL is represented as
 SOURCE:KEY[=VALUE].
-dports can be can be for example: 80/tcp, 53 or 23/udp.`,
-	PreRun: verifyPolicyTrace,
+dports can be can be for example: 80/tcp, 53 or 23/udp.
+If multiple sources and / or destinations are provided, each source is tested whether there is a policy allowing traffic between it and each destination`,
 	Run: func(cmd *cobra.Command, args []string) {
-		srcSlice, err := parseAllowedSlice(src)
-		if err != nil {
-			Fatalf("Invalid source: %s", err)
+
+		srcSlices := [][]string{}
+		dstSlices := [][]string{}
+		var srcSlice, dstSlice []string
+		var dPorts []*models.Port
+		var err error
+
+		if len(src) == 0 && srcIdentity == defaultSecurityID && srcEndpoint == "" && srcK8sPod == "" && srcK8sYaml == "" {
+			Usagef(cmd, "Missing source argument")
 		}
 
-		dstSlice, err := parseAllowedSlice(dst)
-		if err != nil {
-			Fatalf("Invalid destination: %s", err)
+		if len(dst) == 0 && dstIdentity == defaultSecurityID && dstEndpoint == "" && dstK8sPod == "" && dstK8sYaml == "" {
+			Usagef(cmd, "Missing destination argument")
 		}
 
-		dports, err := parseL4PortsSlice(dports)
-		if err != nil {
-			Fatalf("Invalid destination port: %s", err)
+		// Parse provided labels
+		if len(src) > 0 {
+			srcSlice, err = parseLabels(src)
+			if err != nil {
+				Fatalf("Invalid source: %s", err)
+			}
+
+			srcSlices = append(srcSlices, srcSlice)
 		}
 
-		search := models.IdentityContext{
-			From:   srcSlice,
-			To:     dstSlice,
-			Dports: dports,
+		if len(dst) > 0 {
+			dstSlice, err = parseLabels(dst)
+			if err != nil {
+				Fatalf("Invalid destination: %s", err)
+			}
+
+			dstSlices = append(dstSlices, dstSlice)
 		}
 
-		params := NewGetPolicyResolveParams().WithIdentityContext(&search)
-		if scr, err := client.Policy.GetPolicyResolve(params); err != nil {
-			Fatalf("Error while retrieving policy consume result: %s\n", err)
-		} else if scr != nil && scr.Payload != nil {
-			fmt.Printf("%s\n", scr.Payload.Log)
-			fmt.Printf("Verdict: %s\n", scr.Payload.Verdict)
+		if len(dports) > 0 {
+			dPorts, err = parseL4PortsSlice(dports)
+			if err != nil {
+				Fatalf("Invalid destination port: %s", err)
+			}
+		}
+
+		// Parse security identities.
+		if srcIdentity != defaultSecurityID {
+			srcSlice = appendIdentityLabelsToSlice(srcSlice, identity.NumericIdentity(srcIdentity).StringID())
+			srcSlices = append(srcSlices, srcSlice)
+		}
+
+		if dstIdentity != defaultSecurityID {
+			dstSlice = appendIdentityLabelsToSlice(dstSlice, identity.NumericIdentity(dstIdentity).StringID())
+			dstSlices = append(dstSlices, dstSlice)
+		}
+
+		// Parse endpoint IDs.
+		if srcEndpoint != "" {
+			srcSlice = appendEpLabelsToSlice(srcSlice, srcEndpoint)
+			srcSlices = append(srcSlices, srcSlice)
+		}
+
+		if dstEndpoint != "" {
+			dstSlice = appendEpLabelsToSlice(dstSlice, dstEndpoint)
+			dstSlices = append(dstSlices, dstSlice)
+		}
+
+		// Parse pod names.
+		if srcK8sPod != "" {
+			id, err := getSecIDFromK8s(srcK8sPod)
+			if err != nil {
+				Fatalf("Cannot get security id from k8s pod name: %s", err)
+			}
+			srcSlice = appendIdentityLabelsToSlice(srcSlice, id)
+			srcSlices = append(srcSlices, srcSlice)
+		}
+
+		if dstK8sPod != "" {
+			id, err := getSecIDFromK8s(dstK8sPod)
+			if err != nil {
+				Fatalf("Cannot get security id from k8s pod name: %s", err)
+			}
+			dstSlice = appendIdentityLabelsToSlice(dstSlice, id)
+			dstSlices = append(dstSlices, dstSlice)
+		}
+
+		// Parse provided YAML files.
+		if srcK8sYaml != "" {
+			srcYamlSlices, err := trace.GetLabelsFromYaml(srcK8sYaml)
+			if err != nil {
+				Fatalf("%s", err)
+			}
+			for _, v := range srcYamlSlices {
+				srcSlices = append(srcSlices, v)
+			}
+		}
+
+		if dstK8sYaml != "" {
+			dstYamlSlices, err := trace.GetLabelsFromYaml(dstK8sYaml)
+			if err != nil {
+				Fatalf("%s", err)
+			}
+			for _, v := range dstYamlSlices {
+				dstSlices = append(dstSlices, v)
+			}
+		}
+
+		for _, v := range srcSlices {
+			for _, w := range dstSlices {
+				search := models.TraceSelector{
+					From: &models.TraceFrom{
+						Labels: v,
+					},
+					To: &models.TraceTo{
+						Labels: w,
+						Dports: dPorts,
+					},
+					Verbose: verbose,
+				}
+
+				params := NewGetPolicyResolveParams().WithTraceSelector(&search)
+				if scr, err := client.Policy.GetPolicyResolve(params); err != nil {
+					Fatalf("Error while retrieving policy assessment result: %s\n", err)
+				} else if command.OutputJSON() {
+					if err := command.PrintOutput(scr); err != nil {
+						os.Exit(1)
+					}
+				} else if scr != nil && scr.Payload != nil {
+					fmt.Println("----------------------------------------------------------------")
+					fmt.Printf("%s\n", scr.Payload.Log)
+					fmt.Printf("Final verdict: %s\n", strings.ToUpper(scr.Payload.Verdict))
+				}
+			}
 		}
 	},
 }
@@ -72,49 +189,88 @@ dports can be can be for example: 80/tcp, 53 or 23/udp.`,
 func init() {
 	policyCmd.AddCommand(policyTraceCmd)
 	policyTraceCmd.Flags().StringSliceVarP(&src, "src", "s", []string{}, "Source label context")
-	policyTraceCmd.MarkFlagRequired("src")
 	policyTraceCmd.Flags().StringSliceVarP(&dst, "dst", "d", []string{}, "Destination label context")
-	policyTraceCmd.MarkFlagRequired("dst")
 	policyTraceCmd.Flags().StringSliceVarP(&dports, "dport", "", []string{}, "L4 destination port to search on outgoing traffic of the source label context and on incoming traffic of the destination label context")
+	policyTraceCmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Set tracing to TRACE_VERBOSE")
+	policyTraceCmd.Flags().Int64VarP(&srcIdentity, "src-identity", "", defaultSecurityID, "Source identity")
+	policyTraceCmd.Flags().Int64VarP(&dstIdentity, "dst-identity", "", defaultSecurityID, "Destination identity")
+	policyTraceCmd.Flags().StringVarP(&srcEndpoint, "src-endpoint", "", "", "Source endpoint")
+	policyTraceCmd.Flags().StringVarP(&dstEndpoint, "dst-endpoint", "", "", "Destination endpoint")
+	policyTraceCmd.Flags().StringVarP(&srcK8sPod, "src-k8s-pod", "", "", "Source k8s pod ([namespace:]podname)")
+	policyTraceCmd.Flags().StringVarP(&dstK8sPod, "dst-k8s-pod", "", "", "Destination k8s pod ([namespace:]podname)")
+	policyTraceCmd.Flags().StringVarP(&srcK8sYaml, "src-k8s-yaml", "", "", "Path to YAML file for source")
+	policyTraceCmd.Flags().StringVarP(&dstK8sYaml, "dst-k8s-yaml", "", "", "Path to YAML file for destination")
+	command.AddJSONOutput(policyTraceCmd)
 }
 
-func parseAllowedSlice(slice []string) ([]string, error) {
-	inLabels := []string{}
-	id := ""
+func appendIdentityLabelsToSlice(labelSlice []string, secID string) []string {
+	resp, err := client.IdentityGet(secID)
+	if err != nil {
+		Fatalf("%s", err)
+	}
+	return append(labelSlice, resp.Labels...)
+}
 
-	for _, v := range slice {
-		if _, err := strconv.ParseInt(v, 10, 64); err != nil {
-			// can fail which means it needs to be a label
-			inLabels = append(inLabels, v)
-		} else {
-			if id != "" {
-				return nil, fmt.Errorf("More than one security ID provided")
-			}
-
-			id = v
-		}
+func appendEpLabelsToSlice(labelSlice []string, epID string) []string {
+	ep, err := client.EndpointGet(epID)
+	if err != nil {
+		Fatalf("Cannot get endpoint corresponding to identifier %s: %s\n", epID, err)
 	}
 
-	if id != "" {
-		if len(inLabels) > 0 {
-			return nil, fmt.Errorf("You can only specify either ID or labels")
-		}
-
-		resp, err := client.IdentityGet(id)
-		if err != nil {
-			return nil, fmt.Errorf("Unable to retrieve labels for ID %s: %s", id, err)
-		}
-		if resp == nil {
-			return nil, fmt.Errorf("ID %s not found", id)
-		}
-
-		return resp.Labels, nil
-	}
-	if len(inLabels) == 0 {
-		return nil, fmt.Errorf("No label or security ID provided")
+	lbls := []string{}
+	if ep.Status != nil && ep.Status.Identity != nil && ep.Status.Identity.Labels != nil {
+		lbls = ep.Status.Identity.Labels
 	}
 
-	return inLabels, nil
+	return append(labelSlice, lbls...)
+}
+
+func parseLabels(slice []string) ([]string, error) {
+	if len(slice) == 0 {
+		return nil, fmt.Errorf("No labels provided")
+	}
+	return slice, nil
+}
+
+func getSecIDFromK8s(podName string) (string, error) {
+	fmtdPodName := endpoint.NewID(endpoint.PodNamePrefix, podName)
+	_, _, err := endpoint.ValidateID(fmtdPodName)
+	if err != nil {
+		Fatalf("Cannot parse pod name \"%s\": %s", fmtdPodName, err)
+	}
+
+	splitPodName := strings.Split(podName, ":")
+	if len(splitPodName) < 2 {
+		Fatalf("Improper identifier of pod provided; should be <namespace>:<pod name>")
+	}
+	namespace := splitPodName[0]
+	pod := splitPodName[1]
+
+	// The configuration for the Daemon contains the information needed to access the Kubernetes API.
+	resp, err := client.ConfigGet()
+	if err != nil {
+		Fatalf("Error while retrieving configuration: %s", err)
+	}
+	restConfig, err := k8s.CreateConfigFromAgentResponse(resp)
+	if err != nil {
+		return "", fmt.Errorf("unable to create rest configuration: %s", err)
+	}
+	k8sClient, err := k8s.CreateClient(restConfig)
+	if err != nil {
+		return "", fmt.Errorf("unable to create k8s client: %s", err)
+	}
+
+	p, err := k8sClient.CoreV1().Pods(namespace).Get(pod, meta_v1.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("unable to get pod %s in namespace %s", pod, namespace)
+	}
+
+	secID := p.GetAnnotations()[common.CiliumIdentityAnnotation]
+	if secID == "" {
+		return "", fmt.Errorf("cilium-identity annotation not set for pod %s in namespace %s", pod, namespace)
+	}
+
+	return secID, nil
 }
 
 // parseL4PortsSlice parses a given `slice` of strings. Each string should be in
@@ -129,11 +285,11 @@ func parseL4PortsSlice(slice []string) ([]*models.Port, error) {
 		var protoStr string
 		switch len(vSplit) {
 		case 1:
-			protoStr = models.PortProtocolAny
+			protoStr = models.PortProtocolANY
 		case 2:
-			protoStr = strings.ToLower(vSplit[1])
+			protoStr = strings.ToUpper(vSplit[1])
 			switch protoStr {
-			case models.PortProtocolTCP, models.PortProtocolUDP, models.PortProtocolAny:
+			case models.PortProtocolTCP, models.PortProtocolUDP, models.PortProtocolANY:
 			default:
 				return nil, fmt.Errorf("invalid protocol %q", protoStr)
 			}
@@ -152,36 +308,4 @@ func parseL4PortsSlice(slice []string) ([]*models.Port, error) {
 		rules = append(rules, l4)
 	}
 	return rules, nil
-}
-
-func verifyAllowedSlice(slice []string) error {
-	for i, v := range slice {
-		if _, err := strconv.ParseUint(v, 10, 32); err != nil {
-			// can fail which means it needs to be a label
-			labels.ParseLabel(v)
-		} else if i != 0 {
-			return fmt.Errorf("value %q: must be only one unsigned "+
-				"number or label(s) in format of SOURCE:KEY[=VALUE]", v)
-		}
-	}
-
-	return nil
-}
-
-func verifyPolicyTrace(cmd *cobra.Command, args []string) {
-	if len(src) == 0 {
-		Usagef(cmd, "Empty source")
-	}
-
-	if len(src) == 0 {
-		Usagef(cmd, "Empty destination")
-	}
-
-	if err := verifyAllowedSlice(src); err != nil {
-		Usagef(cmd, "Invalid source: %s", err)
-	}
-
-	if err := verifyAllowedSlice(dst); err != nil {
-		Usagef(cmd, "Invalid destination: %s", err)
-	}
 }

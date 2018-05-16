@@ -1,7 +1,9 @@
-{
-        "name": "root",
-	"rules": [{
-		"coverage": ["id.server"],
-		"allow": ["reserved:host", "id.client"]
-	}]
-}
+[{
+    "endpointSelector": {"matchLabels": {"id.server":""}},
+    "ingress": [{
+        "fromEndpoints": [
+          {"matchLabels":{"reserved:host":""}},
+          {"matchLabels":{"id.client":""}}
+	]
+    }]
+}]

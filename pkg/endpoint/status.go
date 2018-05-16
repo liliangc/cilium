@@ -39,14 +39,11 @@ const (
 	Other  StatusType = 0
 )
 
-func NewStatusOK(typ StatusType, info string) Status {
-	return Status{Code: OK, Msg: info, Type: typ}
-}
-
 type Status struct {
-	Code StatusCode `json:"code"`
-	Msg  string     `json:"msg"`
-	Type StatusType `json:"status-type"`
+	Code  StatusCode `json:"code"`
+	Msg   string     `json:"msg"`
+	Type  StatusType `json:"status-type"`
+	State string     `json:"state"`
 }
 
 func (sc StatusCode) ColorString() string {

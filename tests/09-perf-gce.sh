@@ -1,10 +1,16 @@
 #!/bin/bash
 
-source "./helpers.bash"
+dir=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
+source "${dir}/helpers.bash"
+# dir might have been overwritten by helpers.bash
+dir=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
 
-set -e
+TEST_NAME=$(get_filename_without_extension $0)
+LOGS_DIR="${dir}/cilium-files/${TEST_NAME}/logs"
+redirect_debug_logs ${LOGS_DIR}
 
-TEST_NET="cilium"
+set -ex
+
 NETPERF_IMAGE="tgraf/nettools"
 TEST_TIME=30
 SERVER_LABEL="id.server"
@@ -15,25 +21,25 @@ HEADERS=${HEADERS_OFF:+"-P 0"}
 
 # Only run these tests if BENCHMARK=1 and GCE=1 has been set
 if [ -z ${BENCHMARK} ] || [ -z ${GCE} ]; then
-	exit 0
+  exit 0
 fi
 
 function create_k8s_files {
-    sed -e "s+NETPERF_IMAGE+${NETPERF_IMAGE}+" \
-        -e "s+CLIENT_NAME+${CLIENT_NAME}+" \
-        -e "s+CLIENT_LABEL+${CLIENT_LABEL}+" \
-        ./gce-deployment/client.json.sed  > ./gce-deployment/client.json
-    sed -e "s+NETPERF_IMAGE+${NETPERF_IMAGE}+" \
-        -e "s+SERVER_NAME+${SERVER_NAME}+" \
-        -e "s+SERVER_LABEL+${SERVER_LABEL}+" \
-        ./gce-deployment/server.json.sed  > ./gce-deployment/server.json
+  sed -e "s+NETPERF_IMAGE+${NETPERF_IMAGE}+" \
+      -e "s+CLIENT_NAME+${CLIENT_NAME}+" \
+      -e "s+CLIENT_LABEL+${CLIENT_LABEL}+" \
+      ./gce-deployment/client.json.sed  > ./gce-deployment/client.json
+  sed -e "s+NETPERF_IMAGE+${NETPERF_IMAGE}+" \
+      -e "s+SERVER_NAME+${SERVER_NAME}+" \
+      -e "s+SERVER_LABEL+${SERVER_LABEL}+" \
+      ./gce-deployment/server.json.sed  > ./gce-deployment/server.json
 }
 
 create_k8s_files
 
 function cleanup_k8s {
-    kubectl delete -f ./gce-deployment/client.json || true
-    kubectl delete -f ./gce-deployment/server.json || true
+  kubectl delete -f ./gce-deployment/client.json || true
+  kubectl delete -f ./gce-deployment/server.json || true
 }
 
 trap cleanup_k8s EXIT
@@ -41,15 +47,8 @@ trap cleanup_k8s EXIT
 kubectl create -f ./gce-deployment/client.json
 kubectl create -f ./gce-deployment/server.json
 
-while [[ "$(kubectl get pods | grep ${CLIENT_NAME} | grep Running -c)" -ne "1" ]] ; do
-    echo "Waiting for ${CLIENT_NAME} pod to be Running..."
-    sleep 2s
-done
-
-while [[ "$(kubectl get pods | grep ${SERVER_NAME} | grep Running -c)" -ne "1" ]] ; do
-    echo "Waiting for ${SERVER_NAME} pod to be Running..."
-    sleep 2s
-done
+wait_for_running_pod ${CLIENT_NAME}
+wait_for_running_pod ${SERVER_NAME}
 
 echo "Getting Client and Server IPv6, IPv4 and ID from containers"
 
@@ -65,11 +64,11 @@ client_cilium=$(kubectl get pods --output=jsonpath='{range .items[*]}{.metadata.
 echo "..."
 
 function cleanup_cilium {
-    cleanup_k8s
+  cleanup_k8s
 
-    for line in ${server_cilium} ${client_cilium}; do
-        kubectl exec -i ${line} -- cilium config DropNotification=true Debug=true
-    done
+  for line in ${server_cilium} ${client_cilium}; do
+    kubectl exec -i ${line} -- cilium config DropNotification=true TraceNotification=true Debug=true
+  done
 }
 
 trap cleanup_cilium EXIT
@@ -88,88 +87,71 @@ LXC_MAC=$(kubectl exec ${server_cilium} -- cilium endpoint get $SERVER_ID | grep
 
 echo "... Done"
 
-sleep 5
-set -x
-
 cat <<EOF | kubectl exec -i "${server_cilium}" -- cilium -D policy import -
-{
-    "name": "root",
-    "rules": [
-	{
-	    "coverage": [
-		{
-		    "key": "${SERVER_LABEL}",
-		    "source": "k8s"
-		}
-	    ],
-	    "allow": [
-		{
-		    "action": "always-accept",
-		    "label": {
-			"key": "${CLIENT_LABEL}",
-			"source": "k8s"
-		    }
-		}
-	    ]
-	}
-    ]
-}
+[{
+    "endpointSelector": {"matchLabels":{"k8s:${SERVER_LABEL}":""}},
+    "ingress": [{
+        "fromEndpoints": [
+	    {"matchLabels":{"k8s:${CLIENT_LABEL}":""}}
+	]
+    }]
+}]
 EOF
 
 function perf_test() {
-	kubectl exec ${client_pod} -- netperf -6 $HEADERS -l $TEST_TIME -t TCP_STREAM -H $SERVER_IP || {
-		abort "Error: Unable to reach netperf TCP endpoint"
-	}
+  kubectl exec ${client_pod} -- netperf -6 $HEADERS -l $TEST_TIME -t TCP_STREAM -H $SERVER_IP || {
+    abort "Error: Unable to reach netperf TCP endpoint"
+  }
 
-	if [ $SERVER_IP4 ]; then
-		kubectl exec ${client_pod} -- netperf -4 $HEADERS -l $TEST_TIME -t TCP_STREAM -H $SERVER_IP4 || {
-			abort "Error: Unable to reach netperf TCP endpoint"
-		}
-	fi
+  if [ $SERVER_IP4 ]; then
+    kubectl exec ${client_pod} -- netperf -4 $HEADERS -l $TEST_TIME -t TCP_STREAM -H $SERVER_IP4 || {
+      abort "Error: Unable to reach netperf TCP endpoint"
+    }
+  fi
 
-	kubectl exec ${client_pod} -- netperf -6 $HEADERS -l $TEST_TIME -t TCP_SENDFILE -H $SERVER_IP || {
-		abort "Error: Unable to reach netperf TCP endpoint"
-	}
+  kubectl exec ${client_pod} -- netperf -6 $HEADERS -l $TEST_TIME -t TCP_SENDFILE -H $SERVER_IP || {
+    abort "Error: Unable to reach netperf TCP endpoint"
+  }
 
-	if [ $SERVER_IP4 ]; then
-		kubectl exec ${client_pod} -- netperf -4 $HEADERS -l $TEST_TIME -t TCP_SENDFILE -H $SERVER_IP4 || {
-			abort "Error: Unable to reach netperf TCP endpoint"
-		}
-	fi
+  if [ $SERVER_IP4 ]; then
+    kubectl exec ${client_pod} -- netperf -4 $HEADERS -l $TEST_TIME -t TCP_SENDFILE -H $SERVER_IP4 || {
+      abort "Error: Unable to reach netperf TCP endpoint"
+    }
+  fi
 
-	kubectl exec ${client_pod} -- netperf -6 $HEADERS -l $TEST_TIME -t UDP_STREAM -H $SERVER_IP -- -R1 || {
-		abort "Error: Unable to reach netperf UDP endpoint"
-	}
+  kubectl exec ${client_pod} -- netperf -6 $HEADERS -l $TEST_TIME -t UDP_STREAM -H $SERVER_IP -- -R1 || {
+    abort "Error: Unable to reach netperf UDP endpoint"
+  }
 
-	if [ $SERVER_IP4 ]; then
-		kubectl exec ${client_pod} -- netperf -4 $HEADERS -l $TEST_TIME -t UDP_STREAM -H $SERVER_IP4 -- -R1 || {
-			abort "Error: Unable to reach netperf UDP endpoint"
-		}
-	fi
+  if [ $SERVER_IP4 ]; then
+    kubectl exec ${client_pod} -- netperf -4 $HEADERS -l $TEST_TIME -t UDP_STREAM -H $SERVER_IP4 -- -R1 || {
+      abort "Error: Unable to reach netperf UDP endpoint"
+    }
+  fi
 
-	kubectl exec ${client_pod} -- netperf -6 $HEADERS -l $TEST_TIME -t TCP_SENDFILE -H $SERVER_IP -- -m 256 || {
-		abort "Error: Unable to reach netperf TCP endpoint"
-	}
+  kubectl exec ${client_pod} -- netperf -6 $HEADERS -l $TEST_TIME -t TCP_SENDFILE -H $SERVER_IP -- -m 256 || {
+    abort "Error: Unable to reach netperf TCP endpoint"
+  }
 
-	kubectl exec ${client_pod} -- super_netperf 8 -6 -l $TEST_TIME -t TCP_SENDFILE -H $SERVER_IP || {
-		abort "Error: Unable to reach netperf TCP endpoint"
-	}
+  kubectl exec ${client_pod} -- super_netperf 8 -6 -l $TEST_TIME -t TCP_SENDFILE -H $SERVER_IP || {
+    abort "Error: Unable to reach netperf TCP endpoint"
+  }
 
-	if [ $SERVER_IP4 ]; then
-		kubectl exec ${client_pod} -- super_netperf 8 -4 -l $TEST_TIME -t TCP_SENDFILE -H $SERVER_IP4 || {
-			abort "Error: Unable to reach netperf TCP endpoint"
-		}
-	fi
+  if [ $SERVER_IP4 ]; then
+    kubectl exec ${client_pod} -- super_netperf 8 -4 -l $TEST_TIME -t TCP_SENDFILE -H $SERVER_IP4 || {
+      abort "Error: Unable to reach netperf TCP endpoint"
+    }
+  fi
 
-	kubectl exec ${client_pod} -- netperf -6 $HEADERS -l $TEST_TIME -t TCP_RR -H $SERVER_IP || {
-		abort "Error: Unable to reach netperf TCP endpoint"
-	}
+  kubectl exec ${client_pod} -- netperf -6 $HEADERS -l $TEST_TIME -t TCP_RR -H $SERVER_IP || {
+    abort "Error: Unable to reach netperf TCP endpoint"
+  }
 
-	if [ $SERVER_IP4 ]; then
-		kubectl exec ${client_pod} -- netperf -4 $HEADERS -l $TEST_TIME -t TCP_RR -H $SERVER_IP4 || {
-			abort "Error: Unable to reach netperf TCP endpoint"
-		}
-	fi
+  if [ $SERVER_IP4 ]; then
+    kubectl exec ${client_pod} -- netperf -4 $HEADERS -l $TEST_TIME -t TCP_RR -H $SERVER_IP4 || {
+      abort "Error: Unable to reach netperf TCP endpoint"
+    }
+  fi
 
 # FIXME
 #	kubectl exec ${client_pod} -- netperf -6 $HEADERS -l $TEST_TIME -t TCP_CRR -H $SERVER_IP || {
@@ -182,21 +164,21 @@ function perf_test() {
 #		}
 #	fi
 
-	kubectl exec ${client_pod} -- netperf -6 $HEADERS -l $TEST_TIME -t UDP_RR -H $SERVER_IP -- -R1 || {
-		abort "Error: Unable to reach netperf UDP endpoint"
-	}
+  kubectl exec ${client_pod} -- netperf -6 $HEADERS -l $TEST_TIME -t UDP_RR -H $SERVER_IP -- -R1 || {
+    abort "Error: Unable to reach netperf UDP endpoint"
+  }
 
-	if [ $SERVER_IP4 ]; then
-		kubectl exec ${client_pod} -- netperf -4 $HEADERS -l $TEST_TIME -t UDP_RR -H $SERVER_IP4 -- -R1 || {
-			abort "Error: Unable to reach netperf UDP endpoint"
-		}
-	fi
+  if [ $SERVER_IP4 ]; then
+    kubectl exec ${client_pod} -- netperf -4 $HEADERS -l $TEST_TIME -t UDP_RR -H $SERVER_IP4 -- -R1 || {
+      abort "Error: Unable to reach netperf UDP endpoint"
+    }
+  fi
 }
 
-kubectl exec ${server_cilium} -- cilium config DropNotification=false Debug=false
-kubectl exec ${client_cilium} -- cilium config DropNotification=false Debug=false
-kubectl exec ${server_cilium} -- cilium endpoint config $SERVER_ID DropNotification=false Debug=false
-kubectl exec ${client_cilium} -- cilium endpoint config $CLIENT_ID DropNotification=false Debug=false
+kubectl exec ${server_cilium} -- cilium config DropNotification=false TraceNotification=false Debug=false
+kubectl exec ${client_cilium} -- cilium config DropNotification=false TraceNotification=false Debug=false
+kubectl exec ${server_cilium} -- cilium endpoint config $SERVER_ID DropNotification=false TraceNotification=false Debug=false
+kubectl exec ${client_cilium} -- cilium endpoint config $CLIENT_ID DropNotification=false TraceNotification=false Debug=false
 perf_test
 
 kubectl exec ${server_cilium} -- cilium endpoint config $SERVER_ID ConntrackAccounting=false
@@ -209,8 +191,10 @@ echo "Conntrack=false test won't be run!"
 #kubectl exec ${client_cilium} -- cilium endpoint config $CLIENT_ID Conntrack=false
 #perf_test
 
-kubectl exec ${server_cilium} -- cilium endpoint config $SERVER_ID Policy=false
-kubectl exec ${client_cilium} -- cilium endpoint config $CLIENT_ID Policy=false
+kubectl exec ${server_cilium} -- cilium endpoint config $SERVER_ID IngressPolicy=false
+kubectl exec ${server_cilium} -- cilium endpoint config $SERVER_ID EgressPolicy=false
+kubectl exec ${client_cilium} -- cilium endpoint config $CLIENT_ID IngressPolicy=false
+kubectl exec ${client_cilium} -- cilium endpoint config $CLIENT_ID EgressPolicy=false
 perf_test
 
-kubectl exec ${server_cilium} -- cilium -D policy delete "${SERVER_LABEL}"
+kubectl exec ${server_cilium} -- cilium policy delete "${SERVER_LABEL}"

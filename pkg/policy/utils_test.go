@@ -18,28 +18,6 @@ import (
 	. "gopkg.in/check.v1"
 )
 
-func (s *PolicyTestSuite) TestSplitNodePath(c *C) {
-	var removeRootTests = []struct {
-		input     string // input
-		expected1 string // expected result 1
-		expected2 string // expected result 2
-	}{
-		{"", "", ""},
-		{"root", "root", ""},
-		{"root.", "root", ""},
-		{"rootless..foo", "rootless.", "foo"},
-		{"root.foo", "root", "foo"},
-		{"foo.bar", "foo", "bar"},
-		{"foo.bar.baz", "foo.bar", "baz"},
-		{".bar", "", "bar"},
-	}
-	for _, tt := range removeRootTests {
-		actual1, actual2 := SplitNodePath(tt.input)
-		c.Assert(actual1, Equals, tt.expected1)
-		c.Assert(actual2, Equals, tt.expected2)
-	}
-}
-
 func (s *PolicyTestSuite) TestJoinPath(c *C) {
 	var joinPathTests = []struct {
 		input1   string // input 1
@@ -54,26 +32,6 @@ func (s *PolicyTestSuite) TestJoinPath(c *C) {
 	}
 	for _, tt := range joinPathTests {
 		actual := JoinPath(tt.input1, tt.input2)
-		c.Assert(actual, Equals, tt.expected)
-	}
-}
-
-func (s *PolicyTestSuite) TestremoveRootPrefix(c *C) {
-	var removeRootTests = []struct {
-		input    string // input
-		expected string // expected result
-	}{
-		{"", ""},
-		{"root", ""},
-		{"root.", ""},
-		{"root.root.", "root."},
-		{"rootless", "rootless"},
-		{"root.foo", "foo"},
-		{"root..foo", ".foo"},
-		{"foo.bar", "foo.bar"},
-	}
-	for _, tt := range removeRootTests {
-		actual := removeRootPrefix(tt.input)
 		c.Assert(actual, Equals, tt.expected)
 	}
 }

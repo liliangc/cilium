@@ -16,9 +16,9 @@ package cmd
 
 import (
 	"fmt"
-	"os"
 	"strconv"
 
+	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/spf13/cobra"
 )
 
@@ -36,9 +36,13 @@ var serviceDeleteCmd = &cobra.Command{
 			}
 
 			for _, svc := range list {
-				if err := client.DeleteServiceID(svc.ID); err != nil {
-					fmt.Fprintf(os.Stderr, "Warning: Cannot delete service %v: %s",
-						svc, err)
+				if svc.Status == nil || svc.Status.Realized == nil {
+					log.Error("Skipping service due to empty state")
+					continue
+				}
+
+				if err := client.DeleteServiceID(svc.Status.Realized.ID); err != nil {
+					log.WithError(err).WithField(logfields.ServiceID, svc.Status.Realized.ID).Error("Cannot delete service")
 				}
 			}
 
@@ -49,7 +53,7 @@ var serviceDeleteCmd = &cobra.Command{
 		if id, err := strconv.ParseInt(args[0], 0, 64); err != nil {
 			Fatalf("%s", err)
 		} else {
-			if err := client.DeleteServiceID(int64(id)); err != nil {
+			if err := client.DeleteServiceID(id); err != nil {
 				Fatalf("%s", err)
 			}
 

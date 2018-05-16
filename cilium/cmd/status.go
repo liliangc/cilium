@@ -20,6 +20,9 @@ import (
 	"text/tabwriter"
 
 	"github.com/cilium/cilium/api/v1/models"
+	pkg "github.com/cilium/cilium/pkg/client"
+	"github.com/cilium/cilium/pkg/command"
+	healthPkg "github.com/cilium/cilium/pkg/health/client"
 
 	"github.com/spf13/cobra"
 )
@@ -27,55 +30,65 @@ import (
 // statusCmd represents the daemon_status command
 var statusCmd = &cobra.Command{
 	Use:   "status",
-	Short: "Display stsatus of daemon",
+	Short: "Display status of daemon",
 	Run: func(cmd *cobra.Command, args []string) {
-		statusDaemon(cmd, args)
+		statusDaemon()
 	},
 }
+var (
+	allAddresses   bool
+	allControllers bool
+	allHealth      bool
+	allNodes       bool
+	allRedirects   bool
+	brief          bool
+	healthLines    = 10
+)
 
 func init() {
-	RootCmd.AddCommand(statusCmd)
+	rootCmd.AddCommand(statusCmd)
+	statusCmd.Flags().BoolVar(&allAddresses, "all-addresses", false, "Show all allocated addresses, not just count")
+	statusCmd.Flags().BoolVar(&allControllers, "all-controllers", false, "Show all controllers, not just failing")
+	statusCmd.Flags().BoolVar(&allHealth, "all-health", false, "Show all health status, not just failing")
+	statusCmd.Flags().BoolVar(&allNodes, "all-nodes", false, "Show all nodes, not just localhost")
+	statusCmd.Flags().BoolVar(&allRedirects, "all-redirects", false, "Show all redirects")
+	statusCmd.Flags().BoolVar(&brief, "brief", false, "Only print a one-line status message")
+	statusCmd.Flags().BoolVar(&verbose, "verbose", false, "Equivalent to --all-addresses --all-controllers --all-nodes --all-health")
+	command.AddJSONOutput(statusCmd)
 }
 
-func statusDaemon(cmd *cobra.Command, args []string) {
+func statusDaemon() {
+	if verbose {
+		allAddresses = true
+		allControllers = true
+		allHealth = true
+		allNodes = true
+		allRedirects = true
+	}
+	if allHealth {
+		healthLines = 0
+	}
 	if resp, err := client.Daemon.GetHealthz(nil); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: Unable to reach out daemon: %s\n", err)
+		fmt.Fprintf(os.Stderr, "%s\n", pkg.Hint(err))
 		os.Exit(1)
+	} else if command.OutputJSON() {
+		if err := command.PrintOutput(resp.Payload); err != nil {
+			os.Exit(1)
+		}
+	} else if brief {
+		pkg.FormatStatusResponseBrief(os.Stdout, resp.Payload)
 	} else {
 		sr := resp.Payload
 		w := tabwriter.NewWriter(os.Stdout, 2, 0, 3, ' ', 0)
-		if sr.Kvstore != nil {
-			fmt.Fprintf(w, "KVStore:\t%s\n", sr.Kvstore.State)
-		}
-		if sr.ContainerRuntime != nil {
-			fmt.Fprintf(w, "ContainerRuntime:\t%s\n", sr.ContainerRuntime.State)
-		}
-		if sr.Kubernetes != nil {
-			fmt.Fprintf(w, "Kubernetes:\t%s\n", sr.Kubernetes.State)
-		}
-		if sr.Cilium != nil {
-			fmt.Fprintf(w, "Cilium:\t%s\n", sr.Cilium.State)
-		}
-
-		if sr.IPAM != nil {
-			fmt.Printf("Allocated IPv4 addresses:\n")
-			for _, ipv4 := range sr.IPAM.IPV4 {
-				fmt.Printf(" %s\n", ipv4)
-
-			}
-			fmt.Printf("Allocated IPv6 addresses:\n")
-			for _, ipv6 := range sr.IPAM.IPV6 {
-				fmt.Printf(" %s\n", ipv6)
-			}
-		}
-
+		pkg.FormatStatusResponse(w, sr, allAddresses, allControllers, allNodes, allRedirects)
 		w.Flush()
 
-		if sr.Cilium != nil && sr.Cilium.State != models.StatusStateOk {
+		state := sr.Cilium.State
+		if sr.Cilium != nil && state != models.StatusStateOk && state != models.StatusStateDisabled {
 			os.Exit(1)
-		} else {
-			os.Exit(0)
 		}
-	}
 
+		healthPkg.GetAndFormatHealthStatus(w, true, allHealth, healthLines)
+		w.Flush()
+	}
 }

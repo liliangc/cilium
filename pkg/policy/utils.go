@@ -14,38 +14,9 @@
 
 package policy
 
-import (
-	"path/filepath"
-	"strings"
-)
-
-// SplitNodePath splits a policy node path into the path and name portion.
-// Examples:
-//   - "foo.bar"     => "foo", "bar"
-//   - "foo.bar.baz" => "foo.bar", "baz"
-//   - "foo"         => "foo", ""
-//   - ""            => "", ""
-func SplitNodePath(fullPath string) (string, string) {
-	var extension = filepath.Ext(fullPath)
-	if len(extension) > 0 {
-		return fullPath[0 : len(fullPath)-len(extension)], extension[1:]
-	}
-	return fullPath[0 : len(fullPath)-len(extension)], extension
-}
+import "github.com/cilium/cilium/common"
 
 // JoinPath returns a joined path from a and b.
 func JoinPath(a, b string) string {
-	return a + NodePathDelimiter + b
-}
-
-// removeRootPrefix removes an eventual `root.` or `root` prefix from the path.
-func removeRootPrefix(path string) string {
-	if path == RootNodeName {
-		return ""
-	}
-	cut := JoinPath(RootNodeName, "")
-	if strings.HasPrefix(path, cut) {
-		path = strings.TrimPrefix(path, cut)
-	}
-	return path
+	return a + common.PathDelimiter + b
 }

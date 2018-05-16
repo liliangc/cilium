@@ -1,4 +1,4 @@
-// Copyright 2016-2017 Authors of Cilium
+// Copyright 2016-2018 Authors of Cilium
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,61 +15,53 @@
 package proxy
 
 import (
-	"bufio"
 	"fmt"
-	"net"
-	"net/http"
-	"net/url"
-	"os"
-	"strconv"
-	"strings"
+	"math/rand"
 	"sync"
 	"time"
 
+	"github.com/cilium/cilium/api/v1/models"
+	"github.com/cilium/cilium/pkg/completion"
+	"github.com/cilium/cilium/pkg/envoy"
+	"github.com/cilium/cilium/pkg/lock"
+	"github.com/cilium/cilium/pkg/logging"
+	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/maps/proxymap"
+	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/policy"
+	"github.com/cilium/cilium/pkg/proxy/logger"
 
-	"github.com/braintree/manners"
-	"github.com/op/go-logging"
-	"github.com/spf13/viper"
-	"github.com/vulcand/oxy/forward"
-	"github.com/vulcand/route"
+	"github.com/sirupsen/logrus"
 )
 
 var (
-	log     = logging.MustGetLogger("cilium-proxy")
-	logFile *os.File
-	logBuf  *bufio.Writer
+	log = logging.DefaultLogger
 )
 
-type Redirect struct {
-	id       string
-	FromPort uint16
-	ToPort   uint16
-	Rules    []policy.AuxRule
-	source   ProxySource
-	server   *manners.GracefulServer
-	router   route.Router
-}
+// field names used while logging
+const (
+	fieldMarker          = "marker"
+	fieldSocket          = "socket"
+	fieldFd              = "fd"
+	fieldProxyRedirectID = "id"
 
-func (r *Redirect) updateRules(rules []policy.AuxRule) {
-	for _, v := range r.Rules {
-		r.router.RemoveRoute(v.Expr)
-	}
+	// portReuseDelay is the delay until a port is being reused
+	portReuseDelay = 5 * time.Minute
 
-	r.Rules = make([]policy.AuxRule, len(rules))
-	copy(r.Rules, rules)
+	// redirectCreationAttempts is the number of attempts to create a redirect
+	redirectCreationAttempts = 5
+)
 
-	for _, v := range r.Rules {
-		r.router.AddRoute(v.Expr, v)
-	}
-}
-
-type ProxySource interface {
-}
-
+// Proxy maintains state about redirects
 type Proxy struct {
+	*envoy.XDSServer
+
+	// stateDir is the path of the directory where the state of L7 proxies is
+	// stored.
+	stateDir string
+
 	// mutex is the lock required when modifying any proxy datastructure
-	mutex sync.RWMutex
+	mutex lock.RWMutex
 
 	// rangeMin is the minimum port used for proxy port allocation
 	rangeMin uint16
@@ -79,241 +71,229 @@ type Proxy struct {
 	// ports out of the rangeMin-rangeMax range.
 	rangeMax uint16
 
-	// nextPort is the next available proxy port to use
-	nextPort uint16
-
 	// allocatedPorts is a map of all allocated proxy ports pointing
 	// to the redirect rules attached to that port
-	allocatedPorts map[uint16]*Redirect
+	allocatedPorts map[uint16]struct{}
 
 	// redirects is a map of all redirect configurations indexed by
-	// the redirect identifier
+	// the redirect identifier. Redirects may be implemented by different
+	// proxies.
 	redirects map[string]*Redirect
 }
 
-func NewProxy(minPort uint16, maxPort uint16) *Proxy {
+// StartProxySupport starts the servers to support L7 proxies: xDS GRPC server
+// and access log server.
+func StartProxySupport(minPort uint16, maxPort uint16, stateDir string,
+	accessLogFile string, accessLogNotifier logger.LogRecordNotifier, accessLogMetadata []string) *Proxy {
+	xdsServer := envoy.StartXDSServer(stateDir)
+
+	if accessLogFile != "" {
+		if err := logger.OpenLogfile(accessLogFile); err != nil {
+			log.WithError(err).WithField(logger.FieldFilePath, accessLogFile).
+				Warn("Cannot open L7 access log")
+		}
+	}
+
+	if accessLogNotifier != nil {
+		logger.SetNotifier(accessLogNotifier)
+	}
+
+	if len(accessLogMetadata) > 0 {
+		logger.SetMetadata(accessLogMetadata)
+	}
+
+	envoy.StartAccessLogServer(stateDir, xdsServer, DefaultEndpointInfoRegistry)
+
 	return &Proxy{
+		XDSServer:      xdsServer,
+		stateDir:       stateDir,
 		rangeMin:       minPort,
 		rangeMax:       maxPort,
-		nextPort:       minPort,
 		redirects:      make(map[string]*Redirect),
-		allocatedPorts: make(map[uint16]*Redirect),
+		allocatedPorts: make(map[uint16]struct{}),
 	}
+}
+
+var (
+	portRandomizer      = rand.New(rand.NewSource(time.Now().UnixNano()))
+	portRandomizerMutex lock.Mutex
+)
+
+func isPortBindable(port uint16) bool {
+	socket, err := listenSocket(fmt.Sprintf(":%d", port), 0)
+	if err != nil {
+		log.WithError(err).Infof("Skipping port %d already in use", port)
+		return false
+	}
+	socket.Close()
+	return true
 }
 
 func (p *Proxy) allocatePort() (uint16, error) {
-	port := p.nextPort
+	portRandomizerMutex.Lock()
+	defer portRandomizerMutex.Unlock()
 
-	for {
-		resPort := port
-		port++
-		if port >= p.rangeMax {
-			port = p.rangeMin
-		}
+	for _, r := range portRandomizer.Perm(int(p.rangeMax - p.rangeMin + 1)) {
+		resPort := uint16(r) + p.rangeMin
 
 		if _, ok := p.allocatedPorts[resPort]; !ok {
-			return resPort, nil
+			if isPortBindable(resPort) {
+				return resPort, nil
+			}
 		}
 
-		if port == p.nextPort {
-			return 0, fmt.Errorf("no available proxy ports")
-		}
-	}
-}
-
-func generateURL(w http.ResponseWriter, req *http.Request, dport uint16) (*url.URL, error) {
-	ip, port, err := net.SplitHostPort(req.RemoteAddr)
-	if err != nil {
-		return nil, fmt.Errorf("invalid remote address: %s", err)
 	}
 
-	pIP := net.ParseIP(ip)
-	if pIP == nil {
-		return nil, fmt.Errorf("unable to parse IP %s", ip)
-	}
-
-	sport, err := strconv.ParseUint(port, 10, 16)
-	if err != nil {
-		return nil, fmt.Errorf("unable to parse port string: %s", err)
-	}
-
-	key := &Proxy4Key{
-		SPort:   uint16(sport),
-		DPort:   dport,
-		Nexthdr: 6,
-	}
-
-	copy(key.SAddr[:], pIP.To4())
-
-	val, err := LookupEgress4(key)
-	if err != nil {
-		return nil, fmt.Errorf("Unable to find proxy entry for %s: %s", key, err)
-	}
-
-	newUrl := *req.URL
-	newUrl.Scheme = "http"
-	newUrl.Host = val.HostPort()
-	log.Debugf("Found proxy entry: %+v, new-url %+v\n", val, newUrl)
-
-	return &newUrl, nil
+	return 0, fmt.Errorf("no available proxy ports")
 }
 
 var gcOnce sync.Once
 
-type LogRecord struct {
-	timeStart time.Time
-	timeDiff  time.Duration
-	code      int
-	req       *http.Request
-}
-
-func (r *Redirect) Log(l *LogRecord, code int, reason string) {
-	if logBuf == nil {
-		return
-	}
-
-	ip, _, err := net.SplitHostPort(l.req.RemoteAddr)
-	if err != nil {
-		return
-	}
-
-	fmt.Fprintf(logBuf, "%s - - [%s] \"%s %s %s %d %d\" %f\n",
-		ip,
-		l.timeStart.Format("02/Jan/2006 03:04:05"),
-		l.req.Method, l.req.RequestURI, l.req.Proto,
-		code, 0, l.timeDiff.Seconds())
-	logBuf.Flush()
-}
-
-func (p *Proxy) CreateOrUpdateRedirect(l4 *policy.L4Filter, id string, source ProxySource) (*Redirect, error) {
-	fwd, err := forward.New()
-	if err != nil {
-		return nil, err
-	}
-
-	if strings.ToLower(l4.L7Parser) != "http" {
-		return nil, fmt.Errorf("unknown L7 protocol \"%s\"", l4.L7Parser)
-	}
-
-	for _, r := range l4.L7Rules {
-		if !route.IsValid(r.Expr) {
-			return nil, fmt.Errorf("invalid filter expression: %s", r.Expr)
-		}
-	}
-
+// CreateOrUpdateRedirect creates or updates a L4 redirect with corresponding
+// proxy configuration. This will allocate a proxy port as required and launch
+// a proxy instance. If the redirect is already in place, only the rules will be
+// updated.
+func (p *Proxy) CreateOrUpdateRedirect(l4 *policy.L4Filter, id string, localEndpoint logger.EndpointUpdater,
+	wg *completion.WaitGroup) (*Redirect, error) {
 	gcOnce.Do(func() {
-		if lf := viper.GetString("access-log"); lf != "" {
-			if logFile, err = os.OpenFile(lf, os.O_APPEND|os.O_WRONLY, 0666); err != nil {
-				log.Warningf("cannot open access log: %s", err)
-			} else {
-				logBuf = bufio.NewWriter(logFile)
-			}
-		}
-
 		go func() {
 			for {
-				time.Sleep(time.Duration(10) * time.Second)
-				if deleted := GC(); deleted > 0 {
-					log.Debugf("Evicted %d entries from proxy table\n", deleted)
+				time.Sleep(10 * time.Second)
+				if deleted := proxymap.GC(); deleted > 0 {
+					log.WithField("count", deleted).
+						Debug("Evicted entries from proxy table")
 				}
 			}
 		}()
 	})
 
 	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	scopedLog := log.WithField(fieldProxyRedirectID, id)
 
 	if r, ok := p.redirects[id]; ok {
-		r.updateRules(l4.L7Rules)
-		log.Debugf("updated existing proxy instance %+v", r)
-		p.mutex.Unlock()
+		r.mutex.Lock()
+		defer r.mutex.Unlock()
+
+		if r.parserType != l4.L7Parser {
+			return nil, fmt.Errorf("invalid type %q, must be of type %q", l4.L7Parser, r.parserType)
+		}
+
+		r.updateRules(l4)
+		err := r.implementation.UpdateRules(wg)
+		if err != nil {
+			scopedLog.WithError(err).Error("Unable to update ", l4.L7Parser, " proxy")
+			return nil, err
+		}
+
+		r.lastUpdated = time.Now()
+
+		scopedLog.WithField(logfields.Object, logfields.Repr(r)).
+			Debug("updated existing ", l4.L7Parser, " proxy instance")
+
 		return r, nil
 	}
 
-	to, err := p.allocatePort()
-	if err != nil {
-		p.mutex.Unlock()
-		return nil, err
+	redir := newRedirect(localEndpoint, id)
+	redir.endpointID = localEndpoint.GetID()
+	redir.ingress = l4.Ingress
+	redir.parserType = l4.L7Parser
+	redir.updateRules(l4)
+
+retryCreatePort:
+	for nRetry := 0; ; nRetry++ {
+		to, err := p.allocatePort()
+		if err != nil {
+			return nil, err
+		}
+
+		redir.ProxyPort = to
+
+		switch l4.L7Parser {
+		case policy.ParserTypeKafka:
+			redir.implementation, err = createKafkaRedirect(redir, kafkaConfiguration{}, DefaultEndpointInfoRegistry)
+
+		case policy.ParserTypeHTTP:
+			redir.implementation, err = createEnvoyRedirect(redir, p.stateDir, p.XDSServer, wg)
+
+		default:
+			return nil, fmt.Errorf("unsupported L7 parser type: %s", l4.L7Parser)
+		}
+
+		switch {
+		case err == nil:
+			scopedLog.WithField(logfields.Object, logfields.Repr(redir)).
+				Debug("Created new ", l4.L7Parser, " proxy instance")
+
+			p.allocatedPorts[to] = struct{}{}
+			p.redirects[id] = redir
+
+			break retryCreatePort
+
+		// an error occurred, and we have no more retries
+		case nRetry >= redirectCreationAttempts:
+			scopedLog.WithError(err).Error("Unable to create ", l4.L7Parser, " proxy")
+			return nil, err
+
+		// an error occurred and we can retry
+		default:
+			scopedLog.WithError(err).Warning("Unable to create ", l4.L7Parser, " proxy, will retry")
+		}
 	}
-
-	redir := &Redirect{
-		id:       id,
-		FromPort: uint16(l4.Port),
-		ToPort:   to,
-		source:   source,
-		router:   route.New(),
-	}
-
-	redirect := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		startDelta := time.Now()
-		record := &LogRecord{
-			req:       req,
-			timeStart: time.Time{},
-		}
-
-		reason := "no rules"
-
-		// Validate access to L4/L7 resource
-		p.mutex.Lock()
-		if len(redir.Rules) > 0 {
-			rule, _ := redir.router.Route(req)
-			if rule == nil {
-				http.Error(w, "Access denied", http.StatusForbidden)
-				p.mutex.Unlock()
-				redir.Log(record, http.StatusForbidden, "access denied")
-				return
-			} else {
-				ar := rule.(policy.AuxRule)
-				log.Debugf("Allowing request based on rule %+v\n", ar)
-				reason = fmt.Sprintf("rule: %+v", ar)
-			}
-		}
-		p.mutex.Unlock()
-
-		// Reconstruct original URL used for the request
-		if newURL, err := generateURL(w, req, to); err != nil {
-			log.Errorf("%s\n", err)
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			redir.Log(record, http.StatusBadRequest, fmt.Sprintf("cannot generate url: %s", err))
-			return
-		} else {
-			req.URL = newURL
-		}
-
-		fwd.ServeHTTP(w, req)
-		record.timeDiff = time.Now().UTC().Sub(startDelta)
-		redir.Log(record, http.StatusOK, reason)
-	})
-
-	redir.server = manners.NewWithServer(&http.Server{
-		Addr:    fmt.Sprintf(":%d", to),
-		Handler: redirect,
-	})
-
-	redir.updateRules(l4.L7Rules)
-	p.allocatedPorts[to] = redir
-	p.redirects[id] = redir
-
-	p.mutex.Unlock()
-
-	log.Debugf("Created new proxy intance %+v", redir)
-
-	go redir.server.ListenAndServe()
 
 	return redir, nil
 }
 
-func (p *Proxy) RemoveRedirect(id string) error {
+// RemoveRedirect removes an existing redirect.
+func (p *Proxy) RemoveRedirect(id string, wg *completion.WaitGroup) error {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
-
-	if r, ok := p.redirects[id]; !ok {
+	r, ok := p.redirects[id]
+	if !ok {
 		return fmt.Errorf("unable to find redirect %s", id)
-	} else {
-		r.server.Close()
-
-		delete(p.redirects, r.id)
-		delete(p.allocatedPorts, r.ToPort)
 	}
 
+	log.WithField(fieldProxyRedirectID, id).
+		Debug("removing proxy redirect")
+	r.implementation.Close(wg)
+
+	delete(p.redirects, id)
+
+	// delay the release and reuse of the port number so it is guaranteed
+	// to be safe to listen on the port again
+	go func() {
+		time.Sleep(portReuseDelay)
+
+		// The cleanup of the proxymap is delayed a bit to ensure that
+		// the datapath has implemented the redirect change and we
+		// cleanup the map before we release the port and allow reuse
+		proxymap.CleanupOnRedirectClose(r.ProxyPort)
+
+		p.mutex.Lock()
+		delete(p.allocatedPorts, r.ProxyPort)
+		p.mutex.Unlock()
+
+		log.WithField(fieldProxyRedirectID, id).Debugf("Delayed release of proxy port %d", r.ProxyPort)
+	}()
+
 	return nil
+}
+
+// ChangeLogLevel changes proxy log level to correspond to the logrus log level 'level'.
+func ChangeLogLevel(level logrus.Level) {
+	if envoyProxy != nil {
+		envoyProxy.ChangeLogLevel(level)
+	}
+}
+
+// GetStatusModel returns the proxy status as API model
+func (p *Proxy) GetStatusModel() *models.ProxyStatus {
+	p.mutex.RLock()
+	defer p.mutex.RUnlock()
+
+	return &models.ProxyStatus{
+		IP:        node.GetInternalIPv4().String(),
+		PortRange: fmt.Sprintf("%d-%d", p.rangeMin, p.rangeMax),
+	}
 }

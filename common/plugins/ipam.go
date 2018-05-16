@@ -19,7 +19,7 @@ import (
 	"net"
 
 	"github.com/cilium/cilium/api/v1/models"
-	"github.com/cilium/cilium/common/addressing"
+	"github.com/cilium/cilium/pkg/node"
 )
 
 // IPv6Gateway returns the IPv6 gateway address for endpoints.
@@ -37,6 +37,20 @@ func IPv4Gateway(addr *models.NodeAddressing) string {
 type Route struct {
 	Prefix  net.IPNet
 	Nexthop *net.IP
+}
+
+// ToIPCommand converts the route into a full "ip route ..." command
+func (r *Route) ToIPCommand(dev string) []string {
+	res := []string{"ip"}
+	if r.Prefix.IP.To4() == nil {
+		res = append(res, "-6")
+	}
+	res = append(res, "route", "add", r.Prefix.String())
+	if r.Nexthop != nil {
+		res = append(res, "via", r.Nexthop.String())
+	}
+	res = append(res, "dev", dev)
+	return res
 }
 
 // ByMask is used to sort an array of routes by mask, narrow first.
@@ -66,11 +80,11 @@ func IPv6Routes(addr *models.NodeAddressing) ([]Route, error) {
 		{
 			Prefix: net.IPNet{
 				IP:   ip,
-				Mask: addressing.ContainerIPv6Mask,
+				Mask: node.ContainerIPv6Mask,
 			},
 		},
 		{
-			Prefix:  addressing.IPv6DefaultRoute,
+			Prefix:  node.IPv6DefaultRoute,
 			Nexthop: &ip,
 		},
 	}, nil
@@ -86,11 +100,11 @@ func IPv4Routes(addr *models.NodeAddressing) ([]Route, error) {
 		{
 			Prefix: net.IPNet{
 				IP:   ip,
-				Mask: addressing.ContainerIPv4Mask,
+				Mask: node.ContainerIPv4Mask,
 			},
 		},
 		{
-			Prefix:  addressing.IPv4DefaultRoute,
+			Prefix:  node.IPv4DefaultRoute,
 			Nexthop: &ip,
 		},
 	}, nil

@@ -1,15 +1,18 @@
+include ../Makefile.quiet
 include ../Makefile.defs
 
 TARGET=cilium
-SOURCES := $(shell find ../api ../daemon ../common ../pkg cmd . -name '*.go')
+SOURCES := $(shell find ../api ../daemon ../common ../pkg cmd . \( -name '*.go' ! -name '*_test.go' \))
 $(TARGET): $(SOURCES)
-	go build $(GOBUILD) -o $(TARGET)
+	@$(ECHO_GO)
+	$(GO) build -i $(GOBUILD) -o $(TARGET)
 
 all: $(TARGET)
 
 clean:
-	rm -f $(TARGET)
-	go clean
+	@$(ECHO_CLEAN) $(notdir $(shell pwd))
+	-$(QUIET)rm -f $(TARGET)
+	$(GO) clean
 
 install:
 	$(INSTALL) -m 0755 -d $(DESTDIR)$(BINDIR)

@@ -21,24 +21,68 @@ set -u
 LIB=$1
 RUNDIR=$2
 
-#DEV="cilium-probe"
 PROBE_DIR=$(mktemp -d)
 FEATURE_FILE="$RUNDIR/globals/bpf_features.h"
-WARNING_FILE="$RUNDIR/bpf_features.log"
+INFO_FILE="$RUNDIR/bpf_features.log"
+WARNING_FILE="$RUNDIR/bpf_requirements.log"
 
 function cleanup {
 	if [ ! -z "$PROBE_DIR" ]; then
 		rm -rf "$PROBE_DIR"
 	fi
-
-	#ip link del $DEV 2> /dev/null
 }
 
 trap cleanup EXIT
 
+function probe_kernel_config()
+{
+    # BPF Kernel params verifier.
+    local KCONFIG=""
+    local RESULT=0
+    # Coreos kernel config is on /proc/config (module configs).
+    # Other distros in /boot/config-*
+    local config_locations=("/proc/config" "/proc/config.gz",
+        "/boot/config-$(uname -r)")
+    local REQ_PARAMS=(
+        "CONFIG_BPF=y" "CONFIG_BPF_SYSCALL=y" "CONFIG_NET_SCH_INGRESS=[m|y]"
+        "CONFIG_NET_CLS_BPF=[m|y]" "CONFIG_NET_CLS_ACT=y" "CONFIG_BPF_JIT=y"
+        "CONFIG_HAVE_EBPF_JIT=y")
+    local OPT_PARAMS=(
+        "CONFIG_CGROUP_BPF=y" "CONFIG_LWTUNNEL_BPF=y" "CONFIG_BPF_EVENTS=y")
 
-#ip link del $DEV 2> /dev/null
-#ip link add $DEV type dummy || exit 1
+    for config in "${config_locations[@]}"
+    do
+        if [[ -f "$config" ]]; then
+            KCONFIG=$config
+            break
+        fi
+    done
+
+    if [[ -z "$KCONFIG" ]]; then
+        echo "BPF/probes: Kernel config not found." >> $INFO_FILE
+        return
+    fi
+
+    for key in "${OPT_PARAMS[@]}"
+    do
+        zgrep -E "${key}" $KCONFIG > /dev/null || {
+            echo "BPF/probes: ${key} is not in kernel configuration" >> $INFO_FILE
+            }
+    done
+
+    for key in "${REQ_PARAMS[@]}"
+    do
+        zgrep -E "${key}" $KCONFIG > /dev/null || {
+            RESULT=1;
+            echo "BPF/probes: ${key} is not in kernel configuration" >> $WARNING_FILE
+            }
+    done
+
+    if [[ "$RESULT" -gt 0 ]]; then
+        echo "BPF/probes: Missing kernel configuration" >> $WARNING_FILE
+    fi
+}
+
 
 # High level probes that require to invoke tc.
 function probe_run_tc()
@@ -70,21 +114,28 @@ function probe_run_ll()
 
 		cp "$PROBE" "$OUT/raw_probe.t"
 		clang $PROBE_OPTS "$PROBE_BASE/raw_main.c" -o "$OUT/$OUT_BIN" &&
-		"$OUT/$OUT_BIN" 1>> "$FEATURE_FILE" 2>> "$WARNING_FILE"
+		"$OUT/$OUT_BIN" 1>> "$FEATURE_FILE" 2>> "$INFO_FILE"
 	done
 }
 
-rm -f "$WARNING_FILE"
+for file in $INFO_FILE $WARNING_FILE
+do
+	rm -f "$file"
+done
 
 echo "#ifndef BPF_FEATURES_H_"  > "$FEATURE_FILE"
 echo "#define BPF_FEATURES_H_" >> "$FEATURE_FILE"
 echo "" >> "$FEATURE_FILE"
 
 #probe_run_tc "skb_change_tail.c" "HAVE_SKB_CHANGE_TAIL"
+probe_kernel_config
 probe_run_ll
 
 echo "#endif /* BPF_FEATURES_H_ */" >> "$FEATURE_FILE"
 
-if [ ! -s "$WARNING_FILE" ]; then
-	rm -f "$WARNING_FILE"
-fi
+for file in $INFO_FILE $WARNING_FILE
+do
+	if [ ! -s "$file" ]; then
+		rm -f "$file"
+	fi
+done

@@ -18,23 +18,28 @@ import (
 	"fmt"
 	"io/ioutil"
 	"path/filepath"
-	"reflect"
 
 	"github.com/cilium/cilium/common"
 	"github.com/cilium/cilium/pkg/endpoint"
-	"github.com/cilium/cilium/pkg/events"
+	"github.com/cilium/cilium/pkg/endpointmanager"
+	identityPkg "github.com/cilium/cilium/pkg/identity"
+	"github.com/cilium/cilium/pkg/ipam"
+	"github.com/cilium/cilium/pkg/labels"
+	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/option"
+	"github.com/cilium/cilium/pkg/policy"
+	"github.com/cilium/cilium/pkg/workloads/containerd"
 
-	dockerAPI "github.com/docker/engine-api/client"
-	ctx "golang.org/x/net/context"
+	"github.com/sirupsen/logrus"
+	"github.com/vishvananda/netlink"
 )
 
 // SyncState syncs cilium state against the containers running in the host. dir is the
 // cilium's running directory. If clean is set, the endpoints that don't have its
 // container in running state are deleted.
 func (d *Daemon) SyncState(dir string, clean bool) error {
-	restored := 0
 
-	log.Info("Recovering old running endpoints...")
+	log.Info("Restoring endpoints from former life...")
 
 	dirFiles, err := ioutil.ReadDir(dir)
 	if err != nil {
@@ -45,76 +50,136 @@ func (d *Daemon) SyncState(dir string, clean bool) error {
 	possibleEPs := readEPsFromDirNames(dir, eptsID)
 
 	if len(possibleEPs) == 0 {
-		log.Debug("No old endpoints found.")
+		log.Info("No old endpoints found.")
 		return nil
 	}
 
+	nEndpoints := len(possibleEPs)
+
+	// we need to signalize when the endpoints are restored, i.e., when the
+	// essential attributes were populated on the daemon, such as: IPs allocated
+	// and endpoint default options.
+	epRestored := make(chan bool, nEndpoints)
+	// we need to signalize when the endpoints are regenerated, i.e., when
+	// they have finished to rebuild after being restored.
+	epRegenerated := make(chan bool, nEndpoints)
+
 	for _, ep := range possibleEPs {
-		log.Debugf("Restoring endpoint ID %d", ep.ID)
+		go func(ep *endpoint.Endpoint, epRestored, epRegenerated chan<- bool) {
+			scopedLog := log.WithField(logfields.EndpointID, ep.ID)
+			skipRestore := false
+			if _, err := netlink.LinkByName(ep.IfName); err != nil {
+				scopedLog.Infof("Interface %s could not be found for endpoint being restored, ignoring", ep.IfName)
+				skipRestore = true
+			} else if !containerd.IsRunning(ep) {
+				scopedLog.Info("No workload could be associated with endpoint being restored, ignoring")
+				skipRestore = true
+			}
 
-		if err := d.syncLabels(ep); err != nil {
-			log.Warningf("Unable to restore endpoint %+v: %s", ep, err)
-			continue
-		}
+			if clean && skipRestore {
+				d.deleteEndpointQuiet(ep)
+				epRegenerated <- false
+				epRestored <- false
+				return
+			}
 
-		if d.conf.KeepConfig {
-			ep.SetDefaultOpts(nil)
-		} else {
-			ep.SetDefaultOpts(d.conf.Opts)
-		}
+			ep.Mutex.Lock()
+			scopedLog.Debug("Restoring endpoint")
+			ep.LogStatusOKLocked(endpoint.Other, "Restoring endpoint from previous cilium instance")
 
-		if buildSuccess := <-ep.Regenerate(d); !buildSuccess {
-			continue
-		}
+			if err := d.allocateIPsLocked(ep); err != nil {
+				ep.Mutex.Unlock()
+				scopedLog.WithError(err).Error("Failed to re-allocate IP of endpoint. Not restoring endpoint.")
+				d.deleteEndpointQuiet(ep)
+				epRegenerated <- false
+				epRestored <- false
+				return
+			}
 
-		d.endpointsMU.Lock()
-		d.insertEndpoint(ep)
-		d.endpointsMU.Unlock()
-		restored++
+			if option.Config.KeepConfig {
+				ep.SetDefaultOpts(nil)
+			} else {
+				ep.SetDefaultOpts(option.Config.Opts)
+				alwaysEnforce := policy.GetPolicyEnabled() == option.AlwaysEnforce
+				ep.Opts.Set(option.IngressPolicy, alwaysEnforce)
+				ep.Opts.Set(option.EgressPolicy, alwaysEnforce)
+			}
 
-		log.Infof("Restored endpoint: %d", ep.ID)
-	}
+			endpointmanager.Insert(ep)
+			epRestored <- true
 
-	log.Infof("Restored %d endpoints", restored)
+			ep.LogStatusOKLocked(endpoint.Other, "Synchronizing endpoint labels with KVStore")
+			if err := d.syncLabels(ep); err != nil {
+				scopedLog.WithError(err).Warn("Unable to restore endpoint")
+				ep.Mutex.Unlock()
+				epRegenerated <- false
+				return
+			}
+			ready := ep.SetStateLocked(endpoint.StateWaitingToRegenerate, "Triggering synchronous endpoint regeneration while syncing state to host")
+			ep.Mutex.Unlock()
 
-	if clean {
-		d.cleanUpDockerDandlingEndpoints()
-	}
+			if !ready {
+				scopedLog.WithField(logfields.EndpointState, ep.GetState()).Warn("Endpoint in inconsistent state")
+				epRegenerated <- false
+				return
+			}
+			if buildSuccess := <-ep.Regenerate(d, "syncing state to host"); !buildSuccess {
+				scopedLog.Warn("Failed while regenerating endpoint")
+				epRegenerated <- false
+				return
+			}
 
-	d.endpointsMU.Lock()
-	for k := range d.endpoints {
-		ep := d.endpoints[k]
-		if err := d.allocateIPs(ep); err != nil {
-			log.Errorf("Failed while reallocating ep %d's IP addresses: %s. Endpoint won't be restored", ep.ID, err)
-			d.deleteEndpoint(ep)
-			continue
-		}
-
-		log.Infof("EP %d's IP addresses successfully reallocated", ep.ID)
-		if buildSuccess := <-ep.Regenerate(d); !buildSuccess {
-			log.Warningf("Failed while regenerating endpoint %d: %s", ep.ID, err)
-			continue
-		}
-		ep.Mutex.RLock()
-		epID := ep.ID
-		if ep.SecLabel != nil {
-			epLabels := ep.SecLabel.DeepCopy()
+			ep.Mutex.RLock()
+			scopedLog.WithField(logfields.IPAddr, []string{ep.IPv4.String(), ep.IPv6.String()}).Info("Restored endpoint")
 			ep.Mutex.RUnlock()
-			d.events <- *events.NewEvent(events.IdentityAdd, epLabels)
-		} else {
-			ep.Mutex.RUnlock()
-		}
-		log.Infof("Restored endpoint %d", epID)
+			epRegenerated <- true
+		}(ep, epRestored, epRegenerated)
 	}
-	d.endpointsMU.Unlock()
+
+	go func() {
+		regenerated, total := 0, 0
+		if nEndpoints > 0 {
+			for buildSuccess := range epRegenerated {
+				if buildSuccess {
+					regenerated++
+				}
+				total++
+				if total >= nEndpoints {
+					break
+				}
+			}
+		}
+		close(epRegenerated)
+
+		log.WithFields(logrus.Fields{
+			"regenerated": regenerated,
+			"total":       total,
+		}).Info("Finished regenerating restored endpoints")
+	}()
+
+	if nEndpoints > 0 {
+		// We need to wait for the endpoints IPs and labels
+		// are properly synced before continuing.
+		nEPsRestored := 0
+		for range epRestored {
+			nEPsRestored++
+			if nEPsRestored >= nEndpoints {
+				break
+			}
+		}
+		close(epRestored)
+
+		log.WithFields(logrus.Fields{
+			"count.restored": nEPsRestored,
+			"count.total":    nEndpoints,
+		}).Info("Endpoints restored, endpoints will continue to regenerate in background")
+	}
 
 	return nil
 }
 
-func (d *Daemon) allocateIPs(ep *endpoint.Endpoint) error {
-	ep.Mutex.RLock()
-	defer ep.Mutex.RUnlock()
-	err := d.AllocateIP(ep.IPv6.IP())
+func (d *Daemon) allocateIPsLocked(ep *endpoint.Endpoint) error {
+	err := ipam.AllocateIP(ep.IPv6.IP())
 	if err != nil {
 		// TODO if allocation failed reallocate a new IP address and setup veth
 		// pair accordingly
@@ -123,13 +188,13 @@ func (d *Daemon) allocateIPs(ep *endpoint.Endpoint) error {
 
 	defer func(ep *endpoint.Endpoint) {
 		if err != nil {
-			d.ReleaseIP(ep.IPv6.IP())
+			ipam.ReleaseIP(ep.IPv6.IP())
 		}
 	}(ep)
 
-	if !d.conf.IPv4Disabled {
+	if !option.Config.IPv4Disabled {
 		if ep.IPv4 != nil {
-			if err = d.AllocateIP(ep.IPv4.IP()); err != nil {
+			if err = ipam.AllocateIP(ep.IPv4.IP()); err != nil {
 				return fmt.Errorf("unable to reallocate IPv4 address: %s", err)
 			}
 		}
@@ -137,23 +202,25 @@ func (d *Daemon) allocateIPs(ep *endpoint.Endpoint) error {
 	return nil
 }
 
-// readEPsFromDirNames returns a list of endpoints from a list of directory names that
-// possible contain an endpoint.
+// readEPsFromDirNames returns a list of endpoints from a list of directory
+// names that can possible contain an endpoint.
 func readEPsFromDirNames(basePath string, eptsDirNames []string) []*endpoint.Endpoint {
 	possibleEPs := []*endpoint.Endpoint{}
 	for _, epID := range eptsDirNames {
 		epDir := filepath.Join(basePath, epID)
 		readDir := func() string {
-			log.Debugf("Reading directory %s\n", epDir)
+			scopedLog := log.WithFields(logrus.Fields{
+				logfields.EndpointID: epID,
+				logfields.Path:       filepath.Join(epDir, common.CHeaderFileName),
+			})
+			scopedLog.Debug("Reading directory")
 			epFiles, err := ioutil.ReadDir(epDir)
 			if err != nil {
-				log.Warningf("Error while reading directory %q. Ignoring it...", epDir)
+				scopedLog.WithError(err).Warn("Error while reading directory. Ignoring it...")
 				return ""
 			}
 			cHeaderFile := common.FindEPConfigCHeader(epDir, epFiles)
 			if cHeaderFile == "" {
-				log.Infof("File %q not found in %q. Ignoring endpoint %s.",
-					common.CHeaderFileName, epDir, epID)
 				return ""
 			}
 			return cHeaderFile
@@ -163,15 +230,27 @@ func readEPsFromDirNames(basePath string, eptsDirNames []string) []*endpoint.End
 		if cHeaderFile == "" {
 			cHeaderFile = readDir()
 		}
-		log.Debugf("Found endpoint C header file %q\n", cHeaderFile)
+
+		scopedLog := log.WithFields(logrus.Fields{
+			logfields.EndpointID: epID,
+			logfields.Path:       cHeaderFile,
+		})
+
+		if cHeaderFile == "" {
+			scopedLog.Info("C header file not found. Ignoring endpoint")
+			continue
+		}
+
+		scopedLog.Debug("Found endpoint C header file")
+
 		strEp, err := common.GetCiliumVersionString(cHeaderFile)
 		if err != nil {
-			log.Warningf("Unable to read the C header file %q: %s\n", cHeaderFile, err)
+			scopedLog.WithError(err).Warn("Unable to read the C header file")
 			continue
 		}
 		ep, err := endpoint.ParseEndpoint(strEp)
 		if err != nil {
-			log.Warningf("Unable to read the C header file %q: %s\n", cHeaderFile, err)
+			scopedLog.WithError(err).Warn("Unable to parse the C header file")
 			continue
 		}
 		possibleEPs = append(possibleEPs, ep)
@@ -179,97 +258,27 @@ func readEPsFromDirNames(basePath string, eptsDirNames []string) []*endpoint.End
 	return possibleEPs
 }
 
-// syncLabels syncs the labels from the labels' database for the given endpoint. To be
-// used with endpointsMU locked.
+// syncLabels syncs the labels from the labels' database for the given endpoint.
+// To be used with endpoint.Mutex locked.
 func (d *Daemon) syncLabels(ep *endpoint.Endpoint) error {
-	if ep.SecLabel == nil {
-		return fmt.Errorf("Endpoint doesn't have a security label.")
-	}
-
-	sha256sum := ep.SecLabel.Labels.SHA256Sum()
-	labels, err := d.LookupIdentityBySHA256(sha256sum)
+	// Filter the restored labels with the new daemon's filter
+	l, _ := labels.FilterLabels(ep.OpLabels.IdentityLabels())
+	identity, _, err := identityPkg.AllocateIdentity(l)
 	if err != nil {
-		return fmt.Errorf("Unable to get labels of sha256sum:%s: %+v\n", sha256sum, err)
+		return err
 	}
 
-	if ep.DockerID == "" {
-		return nil
-	}
-
-	if labels == nil {
-		l, _, err := d.CreateOrUpdateIdentity(ep.SecLabel.Labels, ep.DockerID)
-		if err != nil {
-			return fmt.Errorf("Unable to put labels %+v: %s\n", ep.SecLabel.Labels, err)
+	if ep.SecurityIdentity != nil {
+		if oldSecID := ep.SecurityIdentity.ID; identity.ID != oldSecID {
+			log.WithFields(logrus.Fields{
+				logfields.EndpointID:              ep.ID,
+				logfields.IdentityLabels + ".old": oldSecID,
+				logfields.IdentityLabels + ".new": identity.ID,
+			}).Info("Security label ID for endpoint is different that the one stored, updating")
 		}
-		labels = l
 	}
 
-	if !reflect.DeepEqual(labels.Labels, ep.SecLabel.Labels) {
-		return fmt.Errorf("The set of labels should be the same for " +
-			"the endpoint being restored and the labels stored")
-	}
-
-	if labels.ID != ep.SecLabel.ID {
-		log.Infof("Security label ID for endpoint %d is different "+
-			"that the one stored, updating from %d to %d\n",
-			ep.ID, ep.SecLabel.ID, labels.ID)
-	}
-	ep.SetIdentity(d, labels)
+	ep.SetIdentity(identity)
 
 	return nil
-}
-
-// cleanUpDockerDandlingEndpoints cleans all endpoints that are dandling by checking out
-// if a particular endpoint has its container running.
-func (d *Daemon) cleanUpDockerDandlingEndpoints() {
-	cleanUp := func(ep *endpoint.Endpoint) {
-		log.Infof("Endpoint %d not found in docker, cleaning up...", ep.ID)
-		ep.Mutex.RUnlock()
-		d.deleteEndpoint(ep)
-	}
-
-	for k := range d.endpoints {
-		ep := d.endpoints[k]
-		ep.Mutex.RLock()
-		log.Debugf("Checking if endpoint is running in docker %d", ep.ID)
-		if ep.DockerNetworkID != "" {
-			nls, err := d.dockerClient.NetworkInspect(ctx.Background(), ep.DockerNetworkID)
-			if dockerAPI.IsErrNetworkNotFound(err) {
-				cleanUp(ep)
-				continue
-			}
-			if err != nil {
-				ep.Mutex.RUnlock()
-				continue
-			}
-			found := false
-			for _, v := range nls.Containers {
-				if v.EndpointID == ep.DockerEndpointID {
-					found = true
-					break
-				}
-			}
-			if !found {
-				cleanUp(ep)
-				continue
-			}
-		} else if ep.DockerID != "" {
-			cont, err := d.dockerClient.ContainerInspect(ctx.Background(), ep.DockerID)
-			if dockerAPI.IsErrContainerNotFound(err) {
-				cleanUp(ep)
-				continue
-			}
-			if err != nil {
-				ep.Mutex.RUnlock()
-				continue
-			}
-			if !cont.State.Running {
-				cleanUp(ep)
-				continue
-			}
-		} else {
-			cleanUp(ep)
-			continue
-		}
-	}
 }

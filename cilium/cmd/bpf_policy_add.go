@@ -15,57 +15,22 @@
 package cmd
 
 import (
-	"strconv"
-
-	"github.com/cilium/cilium/pkg/bpf"
-	"github.com/cilium/cilium/pkg/maps/policymap"
-	"github.com/cilium/cilium/pkg/policy"
+	"github.com/cilium/cilium/common"
 
 	"github.com/spf13/cobra"
 )
 
 // bpfPolicyAddCmd represents the bpf_policy_add command
 var bpfPolicyAddCmd = &cobra.Command{
-	Use:    "add <endpoint id> <identity>",
+	Use:    "add <endpoint id> <traffic-direction> <identity> [port/proto]",
 	Short:  "Add/update policy entry",
 	PreRun: requireEndpointID,
 	Run: func(cmd *cobra.Command, args []string) {
+		common.RequireRootPrivilege("cilium bpf policy add")
 		updatePolicyKey(cmd, args, true)
 	},
 }
 
 func init() {
 	bpfPolicyCmd.AddCommand(bpfPolicyAddCmd)
-}
-
-func updatePolicyKey(cmd *cobra.Command, args []string, add bool) {
-	if len(args) < 2 {
-		Usagef(cmd, "<endpoint id> and <identity> required")
-	}
-
-	lbl := args[0]
-	if id := policy.GetReservedID(lbl); id != policy.ID_UNKNOWN {
-		lbl = "reserved_" + strconv.FormatUint(uint64(id), 10)
-	}
-
-	file := bpf.MapPath(policymap.MapName + lbl)
-	policyMap, _, err := policymap.OpenMap(file)
-	if err != nil {
-		Fatalf("Cannot open policymap '%s' : %s", file, err)
-	}
-
-	peerLbl, err := strconv.ParseUint(args[1], 10, 32)
-	if err != nil {
-		Fatalf("Failed to convert %s", args[1])
-	}
-
-	if add == true {
-		if err := policyMap.AllowConsumer(uint32(peerLbl)); err != nil {
-			Fatalf("Cannot add policy key: %s", err)
-		}
-	} else {
-		if err := policyMap.DeleteConsumer(uint32(peerLbl)); err != nil {
-			Fatalf("Cannot delete policy key: %s", err)
-		}
-	}
 }

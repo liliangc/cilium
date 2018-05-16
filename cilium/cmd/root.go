@@ -16,12 +16,12 @@ package cmd
 
 import (
 	"fmt"
+	"io"
 	"os"
 
-	"github.com/cilium/cilium/common"
 	clientPkg "github.com/cilium/cilium/pkg/client"
 
-	l "github.com/op/go-logging"
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
@@ -29,44 +29,21 @@ import (
 var (
 	cfgFile string
 	client  *clientPkg.Client
-	log     = l.MustGetLogger("cilium")
+	log     = logrus.New()
+	verbose = false
 )
 
-const (
-	bashCompletionFunc = `__cilium_endpoint()
-{
-    local cilium_output out
-    if cilium_output=$(cilium endpoint list --no-headers 2>/dev/null); then
-        out=($(echo "${cilium_output}" | awk '{print $1}'))
-        COMPREPLY=( $( compgen -W "${out[*]}" -- "$cur" ) )
-    fi
-}
-
-__custom_func() {
-    case ${last_command} in
-        cilium_endpoint_get | cilium_endpoint_config | cilium_endpoint_disconnect | cilium_endpoint_labels | cilium_endpoint_regenerate)
-            __cilium_endpoint
-            return
-            ;;
-        *)
-            ;;
-    esac
-}
-`
-)
-
-// RootCmd represents the base command when called without any subcommands
-var RootCmd = &cobra.Command{
+// rootCmd represents the base command when called without any subcommands
+var rootCmd = &cobra.Command{
 	Use:   "cilium",
-	Short: "A brief description of your application",
-	Long:  `TBD`,
-	BashCompletionFunction: bashCompletionFunc,
+	Short: "CLI",
+	Long:  `CLI for interacting with the local Cilium Agent`,
 }
 
 // Execute adds all child commands to the root command sets flags appropriately.
 // This is called by main.main(). It only needs to happen once to the rootCmd.
 func Execute() {
-	if err := RootCmd.Execute(); err != nil {
+	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)
 		os.Exit(-1)
 	}
@@ -74,11 +51,12 @@ func Execute() {
 
 func init() {
 	cobra.OnInitialize(initConfig)
-	flags := RootCmd.PersistentFlags()
+	flags := rootCmd.PersistentFlags()
 	flags.StringVar(&cfgFile, "config", "", "config file (default is $HOME/.cilium.yaml)")
 	flags.BoolP("debug", "D", false, "Enable debug messages")
 	flags.StringP("host", "H", "", "URI to server-side API")
 	viper.BindPFlags(flags)
+	rootCmd.AddCommand(newCmdCompletion(os.Stdout))
 }
 
 // initConfig reads in config file and ENV variables if set.
@@ -98,9 +76,9 @@ func initConfig() {
 	}
 
 	if viper.GetBool("debug") {
-		common.SetupLOG(log, "DEBUG")
+		log.Level = logrus.DebugLevel
 	} else {
-		common.SetupLOG(log, "INFO")
+		log.Level = logrus.InfoLevel
 	}
 
 	if cl, err := clientPkg.NewClient(viper.GetString("host")); err != nil {
@@ -108,4 +86,69 @@ func initConfig() {
 	} else {
 		client = cl
 	}
+}
+
+const copyRightHeader = `
+# Copyright 2017 Authors of Cilium
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+`
+
+var (
+	completionExample = `
+# Installing bash completion on macOS using homebrew
+## If running Bash 3.2 included with macOS
+	brew install bash-completion
+## or, if running Bash 4.1+
+	brew install bash-completion@2
+## afterwards you only need to run
+	cilium completion bash > $(brew --prefix)/etc/bash_completion.d/cilium
+
+
+# Installing bash completion on Linux
+## Load the cilium completion code for bash into the current shell
+	source <(cilium completion bash)
+## Write bash completion code to a file and source if from .bash_profile
+	cilium completion bash > ~/.cilium/completion.bash.inc
+	printf "
+	  # Cilium shell completion
+	  source '$HOME/.cilium/completion.bash.inc'
+	  " >> $HOME/.bash_profile
+	source $HOME/.bash_profile`
+)
+
+func newCmdCompletion(out io.Writer) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "completion [bash]",
+		Short:   "Output shell completion code for bash",
+		Long:    ``,
+		Example: completionExample,
+		Run: func(cmd *cobra.Command, args []string) {
+			runCompletion(out, cmd, args)
+		},
+		ValidArgs: []string{"bash"},
+	}
+
+	return cmd
+}
+
+func runCompletion(out io.Writer, cmd *cobra.Command, args []string) error {
+	if len(args) > 1 {
+		return fmt.Errorf("Too many arguments. Expected only the shell type.")
+	}
+	if _, err := out.Write([]byte(copyRightHeader)); err != nil {
+		return err
+	}
+
+	return cmd.Parent().GenBashCompletion(out)
 }

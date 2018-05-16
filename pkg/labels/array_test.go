@@ -15,6 +15,8 @@
 package labels
 
 import (
+	"github.com/cilium/cilium/pkg/comparator"
+
 	. "gopkg.in/check.v1"
 )
 
@@ -37,4 +39,39 @@ func (s *LabelsSuite) TestMatches(c *C) {
 	c.Assert(a.Contains(empty), Equals, true)  // empty is in a
 	c.Assert(b.Contains(empty), Equals, true)  // empty is in b
 	c.Assert(empty.Contains(a), Equals, false) // a is NOT in empty
+}
+
+func (s *LabelsSuite) TestParse(c *C) {
+	c.Assert(ParseLabelArray(), comparator.DeepEquals, LabelArray{})
+	c.Assert(ParseLabelArray("magic"), comparator.DeepEquals, LabelArray{ParseLabel("magic")})
+	c.Assert(ParseLabelArray("a", "b", "c"), comparator.DeepEquals,
+		LabelArray{ParseLabel("a"), ParseLabel("b"), ParseLabel("c")})
+}
+
+func (s *LabelsSuite) TestHas(c *C) {
+	lbls := LabelArray{
+		NewLabel("env", "devel", LabelSourceAny),
+		NewLabel("user", "bob", LabelSourceContainer),
+	}
+	var hasTests = []struct {
+		input    string // input
+		expected bool   // expected result
+	}{
+		{"", false},
+		{"any", false},
+		{"env", true},
+		{"container.env", false},
+		{"container:env", false},
+		{"any:env", false},
+		{"any.env", true},
+		{"any:user", false},
+		{"any.user", true},
+		{"user", true},
+		{"container.user", true},
+		{"container:bob", false},
+	}
+	for _, tt := range hasTests {
+		c.Logf("has %q?", tt.input)
+		c.Assert(lbls.Has(tt.input), Equals, tt.expected)
+	}
 }

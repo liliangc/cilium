@@ -15,10 +15,12 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
 
-	"github.com/cilium/cilium/pkg/policy"
-
+	"github.com/cilium/cilium/pkg/command"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/spf13/cobra"
 )
 
@@ -33,25 +35,37 @@ var policyImportCmd = &cobra.Command{
 	PreRun: requirePath,
 	Run: func(cmd *cobra.Command, args []string) {
 		path := args[0]
-		if node, err := loadPolicy(path); err != nil {
+		if ruleList, err := loadPolicy(path); err != nil {
 			Fatalf("Cannot parse policy %s: %s\n", path, err)
 		} else {
-			log.Debugf("Constructed policy object for import %+v", node)
+			log.WithField("rule", logfields.Repr(ruleList)).Debug("Constructed policy object for import")
 
 			// Ignore request if no policies have been found
-			if node == nil {
+			if len(ruleList) == 0 {
+				fmt.Printf("No policy specified")
 				return
 			}
 
-			jsonPolicy := node.JSONMarshal()
-			path, name := policy.SplitNodePath(node.Name)
-			if name == "" {
-				path = policy.RootNodeName
+			for _, r := range ruleList {
+				if err := r.Sanitize(); err != nil {
+					Fatalf("%s", err)
+				}
 			}
-			if resp, err := client.PolicyPut(path, jsonPolicy); err != nil {
-				Fatalf("Cannot import policy %s: %s\n", path, err)
+
+			jsonPolicy, err := json.MarshalIndent(ruleList, "", "  ")
+			if err != nil {
+				Fatalf("Cannot marshal policy: %s\n", err)
+			}
+			if resp, err := client.PolicyPut(string(jsonPolicy)); err != nil {
+				Fatalf("Cannot import policy: %s\n", err)
+			} else if command.OutputJSON() {
+				if err := command.PrintOutput(resp); err != nil {
+					os.Exit(1)
+				}
 			} else if printPolicy {
-				fmt.Printf("%s\n", resp)
+				fmt.Printf("%s\nRevision: %d\n", resp.Policy, resp.Revision)
+			} else {
+				fmt.Printf("Revision: %d\n", resp.Revision)
 			}
 		}
 	},
@@ -60,4 +74,5 @@ var policyImportCmd = &cobra.Command{
 func init() {
 	policyCmd.AddCommand(policyImportCmd)
 	policyImportCmd.Flags().BoolVarP(&printPolicy, "print", "", false, "Print policy after import")
+	command.AddJSONOutput(policyImportCmd)
 }

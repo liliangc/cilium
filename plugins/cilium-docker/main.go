@@ -16,22 +16,23 @@ package main
 
 import (
 	"os"
-	"path"
+	"path/filepath"
 
 	"github.com/cilium/cilium/common"
+	"github.com/cilium/cilium/pkg/logging"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/plugins/cilium-docker/driver"
 
-	"fmt"
-	l "github.com/op/go-logging"
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
 
 var (
+	log        = logging.DefaultLogger
 	pluginPath string
 	driverSock string
 	debug      bool
 	ciliumAPI  string
-	log        = l.MustGetLogger("cilium-docker")
 )
 
 // RootCmd represents the base command when called without any subcommands
@@ -50,9 +51,9 @@ connected to a Docker network of type "cilium".`,
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		if d, err := driver.NewDriver(ciliumAPI); err != nil {
-			log.Fatalf("Unable to create cilium-net driver: %s", err)
+			log.WithError(err).Fatal("Unable to create cilium-net driver")
 		} else {
-			log.Infof("Listening for events from Docker on %s", driverSock)
+			log.WithField(logfields.Path, driverSock).Info("Listening for events from Docker")
 			if err := d.Listen(driverSock); err != nil {
 				log.Fatal(err)
 			}
@@ -78,25 +79,21 @@ func init() {
 
 func initConfig() {
 	if debug {
-		common.SetupLOG(log, "DEBUG")
+		log.SetLevel(logrus.DebugLevel)
 	} else {
-		common.SetupLOG(log, "INFO")
+		log.SetLevel(logrus.InfoLevel)
 	}
 
-	// The cilium-docker plugin must be run as root user.
-	if os.Getuid() != 0 {
-		fmt.Fprintf(os.Stderr, "Please run the cilium-docker plugin with root privileges.\n")
-		os.Exit(1)
-	}
+	common.RequireRootPrivilege("cilium-docker")
 
-	driverSock = path.Join(pluginPath, "cilium.sock")
+	driverSock = filepath.Join(pluginPath, "cilium.sock")
 
 	if err := os.MkdirAll(pluginPath, 0755); err != nil && !os.IsExist(err) {
-		log.Fatalf("Could not create net plugin path directory: %s", err)
+		log.WithError(err).Fatal("Could not create net plugin path directory")
 	}
 
 	if _, err := os.Stat(driverSock); err == nil {
-		log.Debugf("socket file %s already exists, unlinking the old file handle.", driverSock)
+		log.WithField(logfields.Path, driverSock).Debug("socket file already exists, unlinking the old file handle.")
 		os.RemoveAll(driverSock)
 	}
 }

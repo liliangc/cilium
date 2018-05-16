@@ -20,6 +20,7 @@ import (
 	"strconv"
 
 	"github.com/cilium/cilium/common/types"
+	"github.com/cilium/cilium/pkg/command"
 
 	"github.com/spf13/cobra"
 )
@@ -38,11 +39,14 @@ var serviceGetCmd = &cobra.Command{
 
 		svc, err := client.GetServiceID(id)
 		if err != nil {
-			Fatalf("Cannot get service: %s\n", err)
+			Fatalf("Cannot get service '%v': %s\n", id, err)
+		}
+		if svc.Status == nil || svc.Status.Realized == nil {
+			Fatalf("Cannot get service '%v': empty response\n", id)
 		}
 
 		slice := []string{}
-		for _, be := range svc.BackendAddresses {
+		for _, be := range svc.Status.Realized.BackendAddresses {
 			if bea, err := types.NewL3n4AddrFromBackendModel(be); err != nil {
 				slice = append(slice, fmt.Sprintf("invalid backend: %+v", be))
 			} else {
@@ -50,18 +54,26 @@ var serviceGetCmd = &cobra.Command{
 			}
 		}
 
-		if fea, err := types.NewL3n4AddrFromModel(svc.FrontendAddress); err != nil {
+		if command.OutputJSON() {
+			if err := command.PrintOutput(svc); err != nil {
+				os.Exit(1)
+			}
+			return
+		}
+
+		if fea, err := types.NewL3n4AddrFromModel(svc.Status.Realized.FrontendAddress); err != nil {
 			fmt.Fprintf(os.Stderr, "invalid frontend model: %s", err)
 		} else {
 			fmt.Printf("%s =>\n", fea.String())
 		}
 
 		for i, be := range slice {
-			fmt.Printf("\t\t%d => %s (%d)\n", i+1, be, svc.ID)
+			fmt.Printf("\t\t%d => %s (%d)\n", i+1, be, svc.Status.Realized.ID)
 		}
 	},
 }
 
 func init() {
 	serviceCmd.AddCommand(serviceGetCmd)
+	command.AddJSONOutput(serviceGetCmd)
 }

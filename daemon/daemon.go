@@ -1,4 +1,4 @@
-// Copyright 2016-2017 Authors of Cilium
+// Copyright 2016-2018 Authors of Cilium
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,93 +16,166 @@ package main
 
 import (
 	"bufio"
-	"encoding/binary"
+	"bytes"
+	"context"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
+	"time"
 
 	"github.com/cilium/cilium/api/v1/models"
 	. "github.com/cilium/cilium/api/v1/server/restapi/daemon"
+	health "github.com/cilium/cilium/cilium-health/launch"
 	"github.com/cilium/cilium/common"
-	"github.com/cilium/cilium/common/addressing"
-	"github.com/cilium/cilium/common/ipam"
 	"github.com/cilium/cilium/common/types"
 	"github.com/cilium/cilium/daemon/defaults"
-	"github.com/cilium/cilium/daemon/options"
+	monitorLaunch "github.com/cilium/cilium/monitor/launch"
 	"github.com/cilium/cilium/pkg/apierror"
 	"github.com/cilium/cilium/pkg/bpf"
-	"github.com/cilium/cilium/pkg/container"
+	"github.com/cilium/cilium/pkg/byteorder"
+	"github.com/cilium/cilium/pkg/controller"
 	"github.com/cilium/cilium/pkg/endpoint"
-	"github.com/cilium/cilium/pkg/events"
+	"github.com/cilium/cilium/pkg/endpointmanager"
+	"github.com/cilium/cilium/pkg/envoy"
+	"github.com/cilium/cilium/pkg/identity"
+	"github.com/cilium/cilium/pkg/ipam"
+	"github.com/cilium/cilium/pkg/ipcache"
 	"github.com/cilium/cilium/pkg/k8s"
-	"github.com/cilium/cilium/pkg/kvstore"
 	"github.com/cilium/cilium/pkg/labels"
+	"github.com/cilium/cilium/pkg/lock"
+	"github.com/cilium/cilium/pkg/logging"
+	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/maps/cidrmap"
 	"github.com/cilium/cilium/pkg/maps/ctmap"
+	ipcachemap "github.com/cilium/cilium/pkg/maps/ipcache"
 	"github.com/cilium/cilium/pkg/maps/lbmap"
 	"github.com/cilium/cilium/pkg/maps/lxcmap"
 	"github.com/cilium/cilium/pkg/maps/policymap"
+	"github.com/cilium/cilium/pkg/maps/proxymap"
+	"github.com/cilium/cilium/pkg/maps/tunnel"
+	"github.com/cilium/cilium/pkg/monitor"
+	"github.com/cilium/cilium/pkg/node"
+	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy"
 	"github.com/cilium/cilium/pkg/proxy"
+	"github.com/cilium/cilium/pkg/proxy/logger"
+	"github.com/cilium/cilium/pkg/u8proto"
+	"github.com/cilium/cilium/pkg/workloads"
+	"github.com/cilium/cilium/pkg/workloads/containerd"
 
-	cniTypes "github.com/containernetworking/cni/pkg/types"
-	hb "github.com/containernetworking/cni/plugins/ipam/host-local/backend/allocator"
-	dClient "github.com/docker/engine-api/client"
 	"github.com/go-openapi/runtime/middleware"
+	"github.com/mattn/go-shellwords"
+	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/kubernetes/pkg/registry/core/service/ipallocator"
+)
+
+const (
+	// ExecTimeout is the execution timeout to use in init.sh executions
+	ExecTimeout = 300 * time.Second
+
+	// AutoCIDR indicates that a CIDR should be allocated
+	AutoCIDR = "auto"
+)
+
+const (
+	initArgLib int = iota
+	initArgRundir
+	initArgIPv4NodeIP
+	initArgIPv6NodeIP
+	initArgMode
+	initArgDevice
+	initArgDevicePreFilter
+	initArgModePreFilter
+	initArgMax
 )
 
 // Daemon is the cilium daemon that is in charge of perform all necessary plumbing,
 // monitoring when a LXC starts.
 type Daemon struct {
 	buildEndpointChan chan *endpoint.Request
-	conf              *Config
-	consumableCache   *policy.ConsumableCache
-	dockerClient      *dClient.Client
-	events            chan events.Event
-	ipamConf          *ipam.IPAMConfig
-	k8sClient         *kubernetes.Clientset
-	kvClient          kvstore.KVClient
 	l7Proxy           *proxy.Proxy
 	loadBalancer      *types.LoadBalancer
 	loopbackIPv4      net.IP
-	policy            policy.Tree
+	policy            *policy.Repository
+	preFilter         *policy.PreFilter
 
-	containersMU sync.RWMutex
-	containers   map[string]*container.Container
+	statusCollectMutex lock.RWMutex
+	statusResponse     models.StatusResponse
 
-	endpointsMU  sync.RWMutex
-	endpoints    map[uint16]*endpoint.Endpoint
-	endpointsAux map[string]*endpoint.Endpoint
-
-	ignoredMutex      sync.RWMutex
-	ignoredContainers map[string]int
-
-	maxCachedLabelIDMU sync.RWMutex
-	maxCachedLabelID   policy.NumericIdentity
-
-	uniqueIDMU sync.Mutex
+	uniqueIDMU lock.Mutex
 	uniqueID   map[uint64]bool
+
+	nodeMonitor  *monitorLaunch.NodeMonitor
+	ciliumHealth *health.CiliumHealth
+
+	// k8sAPIs is a set of k8s API in use. They are setup in EnableK8sWatcher,
+	// and may be disabled while the agent runs.
+	// This is on this object, instead of a global, because EnableK8sWatcher is
+	// on Daemon.
+	k8sAPIGroups k8sAPIGroupsUsed
+
+	// Used to synchronize generation of daemon's BPF programs and endpoint BPF
+	// programs.
+	compilationMutex *lock.RWMutex
+
+	// ipcacheListeners lists all parties interested in IP -> ID mappings.
+	ipcacheListeners []ipcache.IPIdentityMappingListener
 }
 
-func (d *Daemon) GetProxy() *proxy.Proxy {
-	return d.l7Proxy
-}
-
-func (d *Daemon) WriteEndpoint(e *endpoint.Endpoint) error {
-	if err := d.conf.LXCMap.WriteEndpoint(e); err != nil {
-		return fmt.Errorf("Unable to update eBPF map: %s", err)
+// UpdateProxyRedirect updates the redirect rules in the proxy for a particular
+// endpoint using the provided L4 filter. Returns the allocated proxy port
+func (d *Daemon) UpdateProxyRedirect(e *endpoint.Endpoint, l4 *policy.L4Filter) (uint16, error) {
+	if d.l7Proxy == nil {
+		return 0, fmt.Errorf("can't redirect, proxy disabled")
 	}
 
-	return nil
+	r, err := d.l7Proxy.CreateOrUpdateRedirect(l4, e.ProxyID(l4), e, e.ProxyWaitGroup)
+	if err != nil {
+		return 0, err
+	}
+
+	return r.ProxyPort, nil
+}
+
+// RemoveProxyRedirect removes a previously installed proxy redirect for an
+// endpoint
+func (d *Daemon) RemoveProxyRedirect(e *endpoint.Endpoint, id string) error {
+	if d.l7Proxy == nil {
+		return nil
+	}
+
+	log.WithFields(logrus.Fields{
+		logfields.EndpointID: e.ID,
+		logfields.L4PolicyID: id,
+	}).Debug("Removing redirect to endpoint")
+	return d.l7Proxy.RemoveRedirect(id, e.ProxyWaitGroup)
+}
+
+// UpdateNetworkPolicy adds or updates a network policy in the set
+// published to L7 proxies.
+func (d *Daemon) UpdateNetworkPolicy(e *endpoint.Endpoint, policy *policy.L4Policy,
+	labelsMap identity.IdentityCache, deniedIngressIdentities, deniedEgressIdentities map[identity.NumericIdentity]bool) error {
+	if d.l7Proxy == nil {
+		return fmt.Errorf("can't update network policy, proxy disabled")
+	}
+	ingressPolicyEnforced, egressPolicyEnforced := d.EnableEndpointPolicyEnforcement(e)
+	return d.l7Proxy.UpdateNetworkPolicy(e, policy, ingressPolicyEnforced, egressPolicyEnforced,
+		labelsMap, deniedIngressIdentities, deniedEgressIdentities, e.ProxyWaitGroup)
+}
+
+// RemoveNetworkPolicy removes a network policy from the set published to
+// L7 proxies.
+func (d *Daemon) RemoveNetworkPolicy(e *endpoint.Endpoint) {
+	if d.l7Proxy == nil {
+		return
+	}
+	d.l7Proxy.RemoveNetworkPolicy(e)
 }
 
 // QueueEndpointBuild puts the given request in the endpoints queue for
@@ -135,7 +208,7 @@ func (d *Daemon) RemoveFromEndpointQueue(epID uint64) {
 // StartEndpointBuilders creates `nRoutines` go routines that listen on the
 // `d.buildEndpointChan` for new endpoints.
 func (d *Daemon) StartEndpointBuilders(nRoutines int) {
-	log.Debugf("Creating %d worker threads", nRoutines)
+	log.WithField("count", nRoutines).Debug("Creating worker threads")
 	for w := 0; w < nRoutines; w++ {
 		go func() {
 			for e := range d.buildEndpointChan {
@@ -169,47 +242,49 @@ func (d *Daemon) StartEndpointBuilders(nRoutines int) {
 	}
 }
 
+// GetTunnelMode returns the path to the state directory
+func (d *Daemon) GetTunnelMode() string {
+	return option.Config.Tunnel
+}
+
 // GetStateDir returns the path to the state directory
 func (d *Daemon) GetStateDir() string {
-	return d.conf.StateDir
+	return option.Config.StateDir
 }
 
 func (d *Daemon) GetBpfDir() string {
-	return d.conf.BpfDir
+	return option.Config.BpfDir
 }
 
-func (d *Daemon) GetPolicyTree() *policy.Tree {
-	return &d.policy
-}
-
-func (d *Daemon) GetConsumableCache() *policy.ConsumableCache {
-	return d.consumableCache
+// GetPolicyRepository returns the policy repository of the daemon
+func (d *Daemon) GetPolicyRepository() *policy.Repository {
+	return d.policy
 }
 
 func (d *Daemon) TracingEnabled() bool {
-	return d.conf.Opts.IsEnabled(options.PolicyTracing)
+	return option.Config.Opts.IsEnabled(option.PolicyTracing)
 }
 
 func (d *Daemon) DryModeEnabled() bool {
-	return d.conf.DryMode
+	return option.Config.DryMode
 }
 
-func (d *Daemon) PolicyEnabled() bool {
-	return d.conf.Opts.IsEnabled(endpoint.OptionPolicy)
+// PolicyEnforcement returns the type of policy enforcement for the daemon.
+func (d *Daemon) PolicyEnforcement() string {
+	return policy.GetPolicyEnabled()
 }
 
-// DebugEnabled returns whether if debug mode is enabled.
+// DebugEnabled returns if debug mode is enabled.
 func (d *Daemon) DebugEnabled() bool {
-	return d.conf.Opts.IsEnabled(endpoint.OptionDebug)
-}
-
-func createDockerClient(endpoint string) (*dClient.Client, error) {
-	defaultHeaders := map[string]string{"User-Agent": "cilium"}
-	return dClient.NewClient(endpoint, "v1.21", nil, defaultHeaders)
+	return option.Config.Opts.IsEnabled(option.Debug)
 }
 
 func (d *Daemon) writeNetdevHeader(dir string) error {
+
 	headerPath := filepath.Join(dir, common.NetdevHeaderFileName)
+
+	log.WithField(logfields.Path, headerPath).Debug("writing configuration")
+
 	f, err := os.Create(headerPath)
 	if err != nil {
 		return fmt.Errorf("failed to open file %s for writing: %s", headerPath, err)
@@ -218,21 +293,58 @@ func (d *Daemon) writeNetdevHeader(dir string) error {
 	defer f.Close()
 
 	fw := bufio.NewWriter(f)
-	fw.WriteString(d.conf.Opts.GetFmtList())
+	fw.WriteString(option.Config.Opts.GetFmtList())
+	fw.WriteString(d.fmtPolicyEnforcementIngress())
+	fw.WriteString(d.fmtPolicyEnforcementEgress())
 
 	return fw.Flush()
 }
 
-func (d *Daemon) setHostAddresses() error {
-	l, err := netlink.LinkByName(d.conf.LBInterface)
+// returns #define for PolicyIngress based on the configuration of the daemon.
+func (d *Daemon) fmtPolicyEnforcementIngress() string {
+	if policy.GetPolicyEnabled() == option.AlwaysEnforce {
+		return fmt.Sprintf("#define %s\n", option.IngressSpecPolicy.Define)
+	}
+	return fmt.Sprintf("#undef %s\n", option.IngressSpecPolicy.Define)
+}
+
+// returns #define for PolicyEgress based on the configuration of the daemon.
+func (d *Daemon) fmtPolicyEnforcementEgress() string {
+	if policy.GetPolicyEnabled() == option.AlwaysEnforce {
+		return fmt.Sprintf("#define %s\n", option.EgressSpecPolicy.Define)
+	}
+	return fmt.Sprintf("#undef %s\n", option.EgressSpecPolicy.Define)
+}
+
+// Must be called with option.Config.EnablePolicyMU locked.
+func (d *Daemon) writePreFilterHeader(dir string) error {
+	headerPath := filepath.Join(dir, common.PreFilterHeaderFileName)
+	log.WithField(logfields.Path, headerPath).Debug("writing configuration")
+	f, err := os.Create(headerPath)
 	if err != nil {
-		return fmt.Errorf("unable to get network device %s: %s", d.conf.Device, err)
+		return fmt.Errorf("failed to open file %s for writing: %s", headerPath, err)
+
+	}
+	defer f.Close()
+	fw := bufio.NewWriter(f)
+	fmt.Fprint(fw, "/*\n")
+	fmt.Fprintf(fw, " * XDP device: %s\n", option.Config.DevicePreFilter)
+	fmt.Fprintf(fw, " * XDP mode: %s\n", option.Config.ModePreFilter)
+	fmt.Fprint(fw, " */\n\n")
+	d.preFilter.WriteConfig(fw)
+	return fw.Flush()
+}
+
+func (d *Daemon) setHostAddresses() error {
+	l, err := netlink.LinkByName(option.Config.LBInterface)
+	if err != nil {
+		return fmt.Errorf("unable to get network device %s: %s", option.Config.Device, err)
 	}
 
 	getAddr := func(netLinkFamily int) (net.IP, error) {
 		addrs, err := netlink.AddrList(l, netLinkFamily)
 		if err != nil {
-			return nil, fmt.Errorf("error while getting %s's addresses: %s", d.conf.Device, err)
+			return nil, fmt.Errorf("error while getting %s's addresses: %s", option.Config.Device, err)
 		}
 		for _, possibleAddr := range addrs {
 			if netlink.Scope(possibleAddr.Scope) == netlink.SCOPE_UNIVERSE {
@@ -242,14 +354,14 @@ func (d *Daemon) setHostAddresses() error {
 		return nil, nil
 	}
 
-	if !d.conf.IPv4Disabled {
+	if !option.Config.IPv4Disabled {
 		hostV4Addr, err := getAddr(netlink.FAMILY_V4)
 		if err != nil {
 			return err
 		}
 		if hostV4Addr != nil {
-			d.conf.HostV4Addr = hostV4Addr
-			log.Infof("Using IPv4 host address: %s", d.conf.HostV4Addr)
+			option.Config.HostV4Addr = hostV4Addr
+			log.Infof("Using IPv4 host address: %s", option.Config.HostV4Addr)
 		}
 	}
 	hostV6Addr, err := getAddr(netlink.FAMILY_V6)
@@ -257,30 +369,308 @@ func (d *Daemon) setHostAddresses() error {
 		return err
 	}
 	if hostV6Addr != nil {
-		d.conf.HostV6Addr = hostV6Addr
-		log.Infof("Using IPv6 host address: %s", d.conf.HostV6Addr)
+		option.Config.HostV6Addr = hostV6Addr
+		log.Infof("Using IPv6 host address: %s", option.Config.HostV6Addr)
 	}
 	return nil
+}
+
+func runProg(prog string, args []string, quiet bool) error {
+	ctx, cancel := context.WithTimeout(context.Background(), ExecTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, prog, args...).CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		cmd := fmt.Sprintf("%s %s", prog, strings.Join(args, " "))
+		log.WithField("cmd", cmd).Error("Command execution failed: Timeout")
+		return fmt.Errorf("Command execution failed: Timeout for %s %s", prog, args)
+	}
+	if err != nil {
+		if !quiet {
+			cmd := fmt.Sprintf("%s %s", prog, strings.Join(args, " "))
+			log.WithError(err).WithField("cmd", cmd).Error("Command execution failed")
+
+			scanner := bufio.NewScanner(bytes.NewReader(out))
+			for scanner.Scan() {
+				log.Warn(scanner.Text())
+			}
+		}
+	}
+
+	return err
+}
+
+const (
+	ciliumPostNatChain    = "CILIUM_POST"
+	ciliumPostMangleChain = "CILIUM_POST_mangle"
+	ciliumForwardChain    = "CILIUM_FORWARD"
+	feederDescription     = "cilium-feeder:"
+)
+
+type customChain struct {
+	name       string
+	table      string
+	hook       string
+	feederArgs []string
+}
+
+func getFeedRule(name, args string) []string {
+	ruleTail := []string{"-m", "comment", "--comment", feederDescription + " " + name, "-j", name}
+	if args == "" {
+		return ruleTail
+	}
+	argsList, err := shellwords.Parse(args)
+	if err != nil {
+		log.WithError(err).WithField(logfields.Object, args).Fatal("Unable to parse rule into argument slice")
+	}
+	return append(argsList, ruleTail...)
+}
+
+func (c *customChain) add() error {
+	return runProg("iptables", []string{"-t", c.table, "-N", c.name}, false)
+}
+
+func removeCiliumRules(table string) {
+	prog := "iptables"
+	args := []string{"-t", table, "-S"}
+
+	ctx, cancel := context.WithTimeout(context.Background(), ExecTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, prog, args...).CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		cmd := fmt.Sprintf("%s %s", prog, strings.Join(args, " "))
+		log.WithField("cmd", cmd).Error("Command execution failed: Timeout")
+		return
+	}
+	if err != nil {
+		cmd := fmt.Sprintf("%s %s", prog, strings.Join(args, " "))
+		log.WithError(err).WithField("cmd", cmd).Warn("Command execution failed")
+		return
+	}
+
+	scanner := bufio.NewScanner(bytes.NewReader(out))
+	for scanner.Scan() {
+		rule := scanner.Text()
+		log.WithField(logfields.Object, logfields.Repr(rule)).Debug("Considering removing iptables rule")
+
+		if strings.Contains(strings.ToLower(rule), "cilium") &&
+			(strings.HasPrefix(rule, "-A") || strings.HasPrefix(rule, "-I")) {
+			// From: -A POSTROUTING -m comment [...]
+			// To:   -D POSTROUTING -m comment [...]
+			ruleAsArgs, err := shellwords.Parse(strings.Replace(rule, "-A", "-D", 1))
+			if err != nil {
+				log.WithError(err).WithField(logfields.Object, rule).Warn("Unable to parse iptables rule into slice. Leaving rule behind.")
+				continue
+			}
+
+			deleteRule := append([]string{"-t", table}, ruleAsArgs...)
+			log.WithField(logfields.Object, logfields.Repr(deleteRule)).Debug("Removing iptables rule")
+			err = runProg("iptables", deleteRule, true)
+			if err != nil {
+				log.WithError(err).WithField(logfields.Object, rule).Warn("Unable to delete Cilium iptables rule")
+			}
+		}
+	}
+}
+
+func (c *customChain) remove() {
+	runProg("iptables", []string{
+		"-t", c.table,
+		"-F", c.name}, true)
+
+	runProg("iptables", []string{
+		"-t", c.table,
+		"-X", c.name}, true)
+}
+
+func (c *customChain) installFeeder() error {
+	for _, feedArgs := range c.feederArgs {
+		err := runProg("iptables", append([]string{"-t", c.table, "-A", c.hook}, getFeedRule(c.name, feedArgs)...), true)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ciliumChains is the list of custom iptables chain used by Cilium. Custom
+// chains are used to allow for simple replacements of all rules.
+//
+// WARNING: If you change or remove any of the feeder rules you have to ensure
+// that the old feeder rules is also removed on agent start, otherwise,
+// flushing and removing the custom chains will fail.
+var ciliumChains = []customChain{
+	{
+		name:       ciliumPostNatChain,
+		table:      "nat",
+		hook:       "POSTROUTING",
+		feederArgs: []string{""},
+	},
+	{
+		name:       ciliumPostMangleChain,
+		table:      "mangle",
+		hook:       "POSTROUTING",
+		feederArgs: []string{""},
+	},
+	{
+		name:       ciliumForwardChain,
+		table:      "filter",
+		hook:       "FORWARD",
+		feederArgs: []string{""},
+	},
+}
+
+func (d *Daemon) removeIptablesRules() {
+	tables := []string{"nat", "mangle", "raw", "filter"}
+	for _, t := range tables {
+		removeCiliumRules(t)
+	}
+
+	for _, c := range ciliumChains {
+		c.remove()
+	}
+}
+
+func (d *Daemon) installIptablesRules() error {
+	for _, c := range ciliumChains {
+		if err := c.add(); err != nil {
+			return fmt.Errorf("cannot add custom chain %s: %s", c.name, err)
+		}
+	}
+
+	// Clear the Kubernetes masquerading mark bit to skip source PAT
+	// performed by kube-proxy for all packets destined for Cilium. Cilium
+	// installs a dedicated rule which does the source PAT to the right
+	// source IP.
+	if err := runProg("iptables", []string{
+		"-t", "mangle",
+		"-A", ciliumPostMangleChain,
+		"-o", "cilium_host",
+		"-m", "comment", "--comment", "cilium: clear masq bit for pkts to cilium_host",
+		"-j", "MARK", "--set-xmark", "0x0000/0x4000"}, false); err != nil {
+		return err
+	}
+
+	// kube-proxy does not change the default policy of the FORWARD chain
+	// which means that while packets to services are properly DNAT'ed,
+	// they are later dropped in the FORWARD chain. The issue has been
+	// resolved in #52569 and will be fixed in k8s >= 1.8. The following is
+	// a workaround for earlier Kubernetes versions.
+	//
+	// Accept all packets in FORWARD chain that are going to cilium_host
+	// with a destination IP in the cluster range.
+	if err := runProg("iptables", []string{
+		"-A", ciliumForwardChain,
+		"-d", node.GetIPv4ClusterRange().String(),
+		"-o", "cilium_host",
+		"-m", "comment", "--comment", "cilium: any->cluster on cilium_host forward accept",
+		"-j", "ACCEPT"}, false); err != nil {
+		return err
+	}
+
+	// Accept all packets in the FORWARD chain that are coming from the
+	// cilium_host interface with a source IP in the cluster range.
+	if err := runProg("iptables", []string{
+		"-A", ciliumForwardChain,
+		"-s", node.GetIPv4ClusterRange().String(),
+		"-m", "comment", "--comment", "cilium: cluster->any forward accept",
+		"-j", "ACCEPT"}, false); err != nil {
+		return err
+	}
+
+	if masquerade {
+		// Masquerade all traffic from the host into the cilium_host interface
+		// if the source is not the internal IP
+		if err := runProg("iptables", []string{
+			"-t", "nat",
+			"-A", ciliumPostNatChain,
+			"!", "-s", node.GetHostMasqueradeIPv4().String(),
+			"-o", "cilium_host",
+			"-m", "comment", "--comment", "cilium host->cluster masquerade",
+			"-j", "SNAT", "--to-source", node.GetHostMasqueradeIPv4().String()}, false); err != nil {
+			return err
+		}
+
+		// Masquerade all traffic from node prefix not going to node prefix
+		// which is not going over the tunnel device
+		if err := runProg("iptables", []string{
+			"-t", "nat",
+			"-A", "CILIUM_POST",
+			"-s", node.GetIPv4AllocRange().String(),
+			"!", "-d", node.GetIPv4AllocRange().String(),
+			"!", "-o", "cilium_+",
+			"-m", "comment", "--comment", "cilium masquerade non-cluster",
+			"-j", "MASQUERADE"}, false); err != nil {
+			return err
+		}
+	}
+
+	for _, c := range ciliumChains {
+		if err := c.installFeeder(); err != nil {
+			return fmt.Errorf("cannot install feeder rule %s: %s", c.feederArgs, err)
+		}
+	}
+
+	return nil
+}
+
+// GetCompilationLock returns the mutex responsible for synchronizing compilation
+// of BPF programs.
+func (d *Daemon) GetCompilationLock() *lock.RWMutex {
+	return d.compilationMutex
 }
 
 func (d *Daemon) compileBase() error {
 	var args []string
 	var mode string
+	var ret error
+
+	args = make([]string, initArgMax)
+
+	// Lock so that endpoints cannot be built while we are compile base programs.
+	d.compilationMutex.Lock()
+	defer d.compilationMutex.Unlock()
 
 	if err := d.writeNetdevHeader("./"); err != nil {
-		log.Warningf("Unable to write netdev header: %s\n", err)
+		log.WithError(err).Warn("Unable to write netdev header")
 		return err
 	}
 
-	if d.conf.Device != "undefined" {
-		_, err := netlink.LinkByName(d.conf.Device)
-		if err != nil {
-			log.Warningf("Link %s does not exist: %s", d.conf.Device, err)
+	scopedLog := log.WithField(logfields.XDPDevice, option.Config.DevicePreFilter)
+	if option.Config.DevicePreFilter != "undefined" {
+		if err := policy.ProbePreFilter(option.Config.DevicePreFilter, option.Config.ModePreFilter); err != nil {
+			scopedLog.WithError(err).Warn("Turning off prefilter")
+			option.Config.DevicePreFilter = "undefined"
+		}
+	}
+	if option.Config.DevicePreFilter != "undefined" {
+		if d.preFilter, ret = policy.NewPreFilter(); ret != nil {
+			scopedLog.WithError(ret).Warn("Unable to init prefilter")
+			return ret
+		}
+
+		if err := d.writePreFilterHeader("./"); err != nil {
+			scopedLog.WithError(err).Warn("Unable to write prefilter header")
 			return err
 		}
 
-		if d.conf.IsLBEnabled() {
-			if d.conf.Device != d.conf.LBInterface {
+		args[initArgDevicePreFilter] = option.Config.DevicePreFilter
+		args[initArgModePreFilter] = option.Config.ModePreFilter
+	}
+
+	args[initArgLib] = option.Config.BpfDir
+	args[initArgRundir] = option.Config.StateDir
+	args[initArgIPv4NodeIP] = node.GetInternalIPv4().String()
+	args[initArgIPv6NodeIP] = node.GetIPv6().String()
+
+	if option.Config.Device != "undefined" {
+		_, err := netlink.LinkByName(option.Config.Device)
+		if err != nil {
+			log.WithError(err).WithField("device", option.Config.Device).Warn("Link does not exist")
+			return err
+		}
+
+		if option.Config.IsLBEnabled() {
+			if option.Config.Device != option.Config.LBInterface {
 				//FIXME: allow different interfaces
 				return fmt.Errorf("Unable to have an interface for LB mode different than snooping interface")
 			}
@@ -292,22 +682,48 @@ func (d *Daemon) compileBase() error {
 			mode = "direct"
 		}
 
-		args = []string{d.conf.BpfDir, d.conf.StateDir, d.conf.NodeAddress.String(), d.conf.NodeAddress.IPv4Address.String(), mode, d.conf.Device}
+		args[initArgMode] = mode
+		args[initArgDevice] = option.Config.Device
+
+		args = append(args, option.Config.Device)
 	} else {
-		if d.conf.IsLBEnabled() {
+		if option.Config.IsLBEnabled() {
 			//FIXME: allow LBMode in tunnel
 			return fmt.Errorf("Unable to run LB mode with tunnel mode")
 		}
-		args = []string{d.conf.BpfDir, d.conf.StateDir, d.conf.NodeAddress.String(), d.conf.NodeAddress.IPv4Address.String(), d.conf.Tunnel}
+
+		args[initArgMode] = option.Config.Tunnel
 	}
 
-	out, err := exec.Command(filepath.Join(d.conf.BpfDir, "init.sh"), args...).CombinedOutput()
+	prog := filepath.Join(option.Config.BpfDir, "init.sh")
+	ctx, cancel := context.WithTimeout(context.Background(), ExecTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, prog, args...).CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		cmd := fmt.Sprintf("%s %s", prog, strings.Join(args, " "))
+		log.WithField("cmd", cmd).Error("Command execution failed: Timeout")
+		return fmt.Errorf("Command execution failed: Timeout for %s %s", prog, args)
+	}
 	if err != nil {
-		log.Warningf("Command execution %s %s failed: %s",
-			filepath.Join(d.conf.BpfDir, "init.sh"),
-			strings.Join(args, " "), err)
-		log.Warningf("Command output:\n%s", out)
+		cmd := fmt.Sprintf("%s %s", prog, strings.Join(args, " "))
+		log.WithField("cmd", cmd).Error("Command execution failed")
+
+		scanner := bufio.NewScanner(bytes.NewReader(out))
+		for scanner.Scan() {
+			log.Warn(scanner.Text())
+		}
 		return err
+	}
+
+	ipam.ReserveLocalRoutes()
+	node.InstallHostRoutes()
+
+	if !option.Config.IPv4Disabled {
+		// Always remove masquerade rule and then re-add it if required
+		d.removeIptablesRules()
+		if err := d.installIptablesRules(); err != nil {
+			return err
+		}
 	}
 
 	log.Info("Setting sysctl net.core.bpf_jit_enable=1")
@@ -317,115 +733,121 @@ func (d *Daemon) compileBase() error {
 	return nil
 }
 
-// useK8sNodeCIDR sets the ipv4-range value from the cluster-node-cidr defined in the,
-// kube-apiserver.
-func (d *Daemon) useK8sNodeCIDR(nodeName string) error {
-	if d.conf.IPv4Disabled {
-		return nil
-	}
-	k8sNode, err := d.k8sClient.Nodes().Get(nodeName, metav1.GetOptions{})
-	if err != nil {
-		return err
-	}
-	if k8sNode.Spec.PodCIDR == "" {
-		log.Warningf("K8s node %s spec did not provide a CIDR", nodeName)
-		return nil
-	}
-	ip, _, err := net.ParseCIDR(k8sNode.Spec.PodCIDR)
-	if err != nil {
-		return err
-	}
-	ciliumIPv4, err := addressing.NewCiliumIPv4(ip.String())
-	if err != nil {
-		return err
-	}
-	ipv6NodeAddress := d.conf.NodeAddress.IPv6Address.NodeIP().String()
-	nodeAddr, err := addressing.NewNodeAddress(ipv6NodeAddress, ciliumIPv4.NodeIP().String(), "")
-	if err != nil {
-		return err
-	}
-	log.Infof("Retrieved %s for node %s. Using it for ipv4-range", k8sNode.Spec.PodCIDR, nodeName)
-	d.conf.NodeAddress = nodeAddr
-	return nil
-}
-
 func (d *Daemon) init() error {
-	globalsDir := filepath.Join(d.conf.StateDir, "globals")
+	globalsDir := option.Config.GetGlobalsDir()
 	if err := os.MkdirAll(globalsDir, defaults.RuntimePathRights); err != nil {
-		log.Fatalf("Could not create runtime directory %s: %s", globalsDir, err)
+		log.WithError(err).WithField(logfields.Path, globalsDir).Fatal("Could not create runtime directory")
 	}
 
-	if err := os.Chdir(d.conf.StateDir); err != nil {
-		log.Fatalf("Could not change to runtime directory %s: \"%s\"",
-			d.conf.StateDir, err)
+	if err := os.Chdir(option.Config.StateDir); err != nil {
+		log.WithError(err).WithField(logfields.Path, option.Config.StateDir).Fatal("Could not change to runtime directory")
 	}
 
-	f, err := os.Create("./globals/node_config.h")
+	nodeConfigPath := option.Config.GetNodeConfigPath()
+	f, err := os.Create(nodeConfigPath)
 	if err != nil {
-		log.Warningf("Failed to create node configuration file: %s", err)
+		log.WithError(err).WithField(logfields.Path, nodeConfigPath).Fatal("Failed to create node configuration file")
 		return err
 
 	}
 	fw := bufio.NewWriter(f)
 
-	hostIP := d.conf.NodeAddress.IPv6Address.HostIP()
+	routerIP := node.GetIPv6Router()
+	hostIP := node.GetIPv6()
 
 	fmt.Fprintf(fw, ""+
 		"/*\n"+
 		" * Node-IPv6: %s\n"+
-		" * Host-IPv6: %s\n",
-		d.conf.NodeAddress.IPv6Address.IP().String(),
-		hostIP.String())
+		" * Router-IPv6: %s\n",
+		hostIP.String(), routerIP.String())
 
-	if d.conf.IPv4Disabled {
+	if option.Config.IPv4Disabled {
 		fw.WriteString(" */\n\n")
 	} else {
 		fmt.Fprintf(fw, ""+
 			" * Host-IPv4: %s\n"+
 			" */\n\n"+
 			"#define ENABLE_IPV4\n",
-			d.conf.NodeAddress.IPv4Address.IP().String())
+			node.GetInternalIPv4().String())
 	}
 
-	fmt.Fprintf(fw, "#define NODE_ID %#x\n", d.conf.NodeAddress.IPv6Address.NodeID())
-	fw.WriteString(common.FmtDefineArray("ROUTER_IP", d.conf.NodeAddress.IPv6Address))
+	fw.WriteString(common.FmtDefineComma("ROUTER_IP", routerIP))
 
-	ipv4GW := d.conf.NodeAddress.IPv4Address
-	fmt.Fprintf(fw, "#define IPV4_GATEWAY %#x\n", binary.LittleEndian.Uint32(ipv4GW))
-
-	if !d.conf.IPv4Disabled {
-		fmt.Fprintf(fw, "#define IPV4_LOOPBACK %#x\n", binary.LittleEndian.Uint32(d.loopbackIPv4))
+	if !option.Config.IPv4Disabled {
+		ipv4GW := node.GetInternalIPv4()
+		fmt.Fprintf(fw, "#define IPV4_GATEWAY %#x\n", byteorder.HostSliceToNetwork(ipv4GW, reflect.Uint32).(uint32))
+		fmt.Fprintf(fw, "#define IPV4_LOOPBACK %#x\n", byteorder.HostSliceToNetwork(d.loopbackIPv4, reflect.Uint32).(uint32))
+	} else {
+		// FIXME: Workaround so the bpf program compiles
+		fmt.Fprintf(fw, "#define IPV4_GATEWAY %#x\n", 0)
+		fmt.Fprintf(fw, "#define IPV4_LOOPBACK %#x\n", 0)
 	}
 
-	ipv4Range := d.conf.NodeAddress.IPv4AllocRange()
-	fmt.Fprintf(fw, "#define IPV4_RANGE %#x\n", binary.LittleEndian.Uint32(ipv4Range.IP))
-	fmt.Fprintf(fw, "#define IPV4_MASK %#x\n", binary.LittleEndian.Uint32(ipv4Range.Mask))
+	ipv4Range := node.GetIPv4AllocRange()
+	fmt.Fprintf(fw, "#define IPV4_MASK %#x\n", byteorder.HostSliceToNetwork(ipv4Range.Mask, reflect.Uint32).(uint32))
 
-	ipv4ClusterRange := d.conf.NodeAddress.IPv4ClusterRange()
-	fmt.Fprintf(fw, "#define IPV4_CLUSTER_RANGE %#x\n", binary.LittleEndian.Uint32(ipv4ClusterRange.IP))
-	fmt.Fprintf(fw, "#define IPV4_CLUSTER_MASK %#x\n", binary.LittleEndian.Uint32(ipv4ClusterRange.Mask))
+	ipv4ClusterRange := node.GetIPv4ClusterRange()
+	fmt.Fprintf(fw, "#define IPV4_CLUSTER_RANGE %#x\n", byteorder.HostSliceToNetwork(ipv4ClusterRange.IP, reflect.Uint32).(uint32))
+	fmt.Fprintf(fw, "#define IPV4_CLUSTER_MASK %#x\n", byteorder.HostSliceToNetwork(ipv4ClusterRange.Mask, reflect.Uint32).(uint32))
 
-	if nat46Range := d.conf.NAT46Prefix; nat46Range != nil {
+	if nat46Range := option.Config.NAT46Prefix; nat46Range != nil {
 		fw.WriteString(common.FmtDefineAddress("NAT46_PREFIX", nat46Range.IP))
 	}
 
-	fw.WriteString(common.FmtDefineAddress("HOST_IP", hostIP))
-	fmt.Fprintf(fw, "#define HOST_ID %d\n", policy.GetReservedID(labels.IDNameHost))
-	fmt.Fprintf(fw, "#define WORLD_ID %d\n", policy.GetReservedID(labels.IDNameWorld))
+	fw.WriteString(common.FmtDefineComma("HOST_IP", hostIP))
+	fmt.Fprintf(fw, "#define HOST_ID %d\n", identity.GetReservedID(labels.IDNameHost))
+	fmt.Fprintf(fw, "#define WORLD_ID %d\n", identity.GetReservedID(labels.IDNameWorld))
+	fmt.Fprintf(fw, "#define CLUSTER_ID %d\n", identity.GetReservedID(labels.IDNameCluster))
 	fmt.Fprintf(fw, "#define LB_RR_MAX_SEQ %d\n", lbmap.MaxSeq)
+	fmt.Fprintf(fw, "#define CILIUM_LB_MAP_MAX_ENTRIES %d\n", lbmap.MaxEntries)
+	fmt.Fprintf(fw, "#define TUNNEL_ENDPOINT_MAP_SIZE %d\n", tunnel.MaxEntries)
+	fmt.Fprintf(fw, "#define PROXY_MAP_SIZE %d\n", proxymap.MaxEntries)
+	fmt.Fprintf(fw, "#define ENDPOINTS_MAP_SIZE %d\n", lxcmap.MaxEntries)
+	fmt.Fprintf(fw, "#define LPM_MAP_SIZE %d\n", cidrmap.MaxEntries)
+	fmt.Fprintf(fw, "#define POLICY_MAP_SIZE %d\n", policymap.MaxEntries)
+	fmt.Fprintf(fw, "#define IPCACHE_MAP_SIZE %d\n", ipcachemap.MaxEntries)
+	fmt.Fprintf(fw, "#define POLICY_PROG_MAP_SIZE %d\n", policymap.ProgArrayMaxEntries)
+
+	fmt.Fprintf(fw, "#define TRACE_PAYLOAD_LEN %dULL\n", tracePayloadLen)
 
 	fw.Flush()
 	f.Close()
 
 	if !d.DryModeEnabled() {
+		// Validate existing map paths before attempting BPF compile.
+		if err = d.validateExistingMaps(); err != nil {
+			log.WithError(err).Error("Error while validating maps")
+			return err
+		}
+
 		if err := d.compileBase(); err != nil {
 			return err
 		}
-		d.conf.LXCMap, err = lxcmap.OpenMap()
-		if err != nil {
-			log.Warningf("Could not create BPF endpoint map: %s", err)
+
+		// Clean all endpoint entries
+		if err := lxcmap.LXCMap.DeleteAll(); err != nil {
 			return err
 		}
+
+		// Set up the list of IPCache listeners in the daemon, to be
+		// used by syncLXCMap().
+		d.ipcacheListeners = []ipcache.IPIdentityMappingListener{d, &envoy.NetworkPolicyHostsCache}
+
+		// Insert local host entries to bpf maps
+		if err := d.syncLXCMap(); err != nil {
+			return err
+		}
+
+		// Start the controller for periodic sync
+		// The purpose of the controller is to ensure that the host entries are
+		// reinserted to the bpf maps if they are ever removed from them.
+		// TODO: Determine if we can get rid of this when we have more rigorous
+		//       desired/realized state implementation for the bpf maps.
+		controller.NewManager().UpdateController("lxcmap-bpf-host-sync",
+			controller.ControllerParams{
+				DoFunc:      func() error { return d.syncLXCMap() },
+				RunInterval: time.Duration(5) * time.Second,
+			})
 
 		if _, err := lbmap.Service6Map.OpenOrCreate(); err != nil {
 			return err
@@ -436,7 +858,7 @@ func (d *Daemon) init() error {
 		if _, err := lbmap.RRSeq6Map.OpenOrCreate(); err != nil {
 			return err
 		}
-		if !d.conf.IPv4Disabled {
+		if !option.Config.IPv4Disabled {
 			if _, err := lbmap.Service4Map.OpenOrCreate(); err != nil {
 				return err
 			}
@@ -448,226 +870,368 @@ func (d *Daemon) init() error {
 			}
 		}
 		// Clean all lb entries
-		if !d.conf.RestoreState {
-			// FIXME Remove all loadbalancer entries
+		if !option.Config.RestoreState {
+			log.Debug("cleaning up all BPF LB maps")
+
+			d.loadBalancer.BPFMapMU.Lock()
+			defer d.loadBalancer.BPFMapMU.Unlock()
+
+			if err := lbmap.Service6Map.DeleteAll(); err != nil {
+				return err
+			}
+			if err := d.RevNATDeleteAll(); err != nil {
+				return err
+			}
+			if err := lbmap.RRSeq6Map.DeleteAll(); err != nil {
+				return err
+			}
+
+			if !option.Config.IPv4Disabled {
+				if err := lbmap.Service4Map.DeleteAll(); err != nil {
+					return err
+				}
+				if err := lbmap.RRSeq4Map.DeleteAll(); err != nil {
+					return err
+				}
+			}
 		}
 	}
 
 	return nil
 }
 
-func (c *Config) createIPAMConf() (*ipam.IPAMConfig, error) {
-
-	ipamSubnets := net.IPNet{
-		IP:   c.NodeAddress.IPv6Address.IP(),
-		Mask: addressing.StateIPv6Mask,
-	}
-
-	ipamConf := &ipam.IPAMConfig{
-		IPAMConfig: hb.IPAMConfig{
-			Name:    "cilium-local-IPAM",
-			Subnet:  cniTypes.IPNet(ipamSubnets),
-			Gateway: c.NodeAddress.IPv6Address.IP(),
-			Routes: []cniTypes.Route{
-				// IPv6
-				{
-					Dst: c.NodeAddress.IPv6Route,
-				},
-				{
-					Dst: addressing.IPv6DefaultRoute,
-					GW:  c.NodeAddress.IPv6Address.IP(),
-				},
-			},
+// syncLXCMap adds local host enties to bpf lxcmap, as well as
+// ipcache, if needed, and also notifies the daemon and network policy
+// hosts cache if changes were made.
+func (d *Daemon) syncLXCMap() error {
+	// TODO: Update addresses first, in case node addressing has changed.
+	// TODO: Once these start changing on runtime, figure out the locking strategy.
+	// TODO: Delete stale host entries from the lxcmap.
+	specialIdentities := []identity.IPIdentityPair{
+		{
+			IP: node.GetInternalIPv4(),
+			ID: identity.ReservedIdentityHost,
 		},
-		IPv6Allocator: ipallocator.NewCIDRRange(c.NodeAddress.IPv6AllocRange()),
+		{
+			IP: node.GetExternalIPv4(),
+			ID: identity.ReservedIdentityHost,
+		},
+		{
+			IP: node.GetIPv6(),
+			ID: identity.ReservedIdentityHost,
+		},
+		{
+			IP: node.GetIPv6Router(),
+			ID: identity.ReservedIdentityHost,
+		},
+		{
+			IP:   node.GetIPv6ClusterRange().IP,
+			Mask: node.GetIPv6ClusterRange().Mask,
+			ID:   identity.ReservedIdentityCluster,
+		},
+		{
+			IP:   node.GetIPv4ClusterRange().IP,
+			Mask: node.GetIPv4ClusterRange().Mask,
+			ID:   identity.ReservedIdentityCluster,
+		},
+		{
+			IP:   net.IPv4zero,
+			Mask: net.CIDRMask(0, net.IPv4len*8),
+			ID:   identity.ReservedIdentityWorld,
+		},
+		{
+			IP:   net.IPv6zero,
+			Mask: net.CIDRMask(0, net.IPv6len*8),
+			ID:   identity.ReservedIdentityWorld,
+		},
 	}
 
-	if !c.IPv4Disabled {
-		ipamConf.IPv4Allocator = ipallocator.NewCIDRRange(c.NodeAddress.IPv4AllocRange())
-		ipamConf.IPAMConfig.Routes = append(ipamConf.IPAMConfig.Routes,
-			// IPv4
-			cniTypes.Route{
-				Dst: c.NodeAddress.IPv4Route,
-			},
-			cniTypes.Route{
-				Dst: addressing.IPv4DefaultRoute,
-				GW:  c.NodeAddress.IPv4Address.IP(),
-			})
-		// Reserve the IPv4 router IP in the IPv4 allocation range to ensure
-		// that we do not hand out the router IP to a container.
-		err := ipamConf.IPv4Allocator.Allocate(c.NodeAddress.IPv4Address.IP())
-		if err != nil {
-			return nil, fmt.Errorf("Unable to reserve IPv4 router address %s: %s",
-				c.NodeAddress.IPv4Address.String(), err)
+	for _, pair := range specialIdentities {
+		isHost := pair.ID == identity.ReservedIdentityHost
+		if isHost {
+			added, err := lxcmap.SyncHostEntry(pair.IP)
+			if err != nil {
+				return fmt.Errorf("Unable to add host entry to endpoint map: %s", err)
+			}
+			if added {
+				log.WithField(logfields.IPAddr, pair.IP).Debugf("Added local ip to endpoint map")
+			}
 		}
-
+		prefix := pair.PrefixString()
+		id, exists := ipcache.IPIdentityCache.LookupByIP(prefix)
+		if !exists || id != pair.ID {
+			// Upsert will not propagate (reserved:foo->ID) mappings across the cluster,
+			// and we specifically don't want to do so.
+			// Manually push it into each IPIdentityMappingListener.
+			log.WithField(logfields.IPAddr, prefix).Debug("Adding special identity to ipcache")
+			ipcache.IPIdentityCache.Upsert(prefix, pair.ID)
+			for _, listener := range d.ipcacheListeners {
+				listener.OnIPIdentityCacheChange(ipcache.Upsert, pair)
+			}
+		}
 	}
-
-	return ipamConf, nil
+	return nil
 }
 
 // NewDaemon creates and returns a new Daemon with the parameters set in c.
-func NewDaemon(c *Config) (*Daemon, error) {
-	if c == nil {
-		return nil, fmt.Errorf("Configuration is nil")
-	}
-
-	var kvClient kvstore.KVClient
-
-	// Create new key-value store client structures based on provided kvstore type.
-	switch c.KVStore {
-	case kvstore.Consul:
-		if c.ConsulConfig != nil {
-			log.Infof("Using consul as key-value store")
-			c, err := kvstore.NewConsulClient(c.ConsulConfig)
-			if err != nil {
-				return nil, err
-			}
-			kvClient = c
-		} else {
-			return nil, fmt.Errorf("invalid configuration for consul provided; please specify the address to a consul instance with the --consul option")
+func NewDaemon() (*Daemon, error) {
+	if opts := workloads.GetRuntimeOpt(workloads.Docker); opts != nil {
+		if err := containerd.Init(dockerEndpoint); err != nil {
+			return nil, err
 		}
-	case kvstore.Etcd:
-		if c.EtcdCfgPath != "" || c.EtcdConfig != nil {
-			log.Infof("Using etcd as key-value store")
-			c, err := kvstore.NewEtcdClient(c.EtcdConfig, c.EtcdCfgPath)
-			if err != nil {
-				return nil, err
-			}
-			kvClient = c
-		} else {
-			return nil, fmt.Errorf("invalid configuration for etcd provided; please specify an etcd configuration path with --etcd-config-path or an etcd agent address with --etcd")
-		}
-	case kvstore.Local:
-		log.Infof("Using local storage as key-value store")
-		kvClient = kvstore.NewLocalClient()
-	}
-
-	dockerClient, err := createDockerClient(c.DockerEndpoint)
-	if err != nil {
-		return nil, err
 	}
 
 	lb := types.NewLoadBalancer()
 
 	d := Daemon{
-		conf:              c,
-		kvClient:          kvClient,
-		dockerClient:      dockerClient,
-		containers:        make(map[string]*container.Container),
-		endpoints:         make(map[uint16]*endpoint.Endpoint),
-		endpointsAux:      make(map[string]*endpoint.Endpoint),
-		events:            make(chan events.Event, 512),
-		loadBalancer:      lb,
-		consumableCache:   policy.NewConsumableCache(),
-		policy:            policy.Tree{},
-		ignoredContainers: make(map[string]int),
-		buildEndpointChan: make(chan *endpoint.Request, common.EndpointsPerHost),
-		uniqueID:          map[uint64]bool{},
+		loadBalancer: lb,
+		policy:       policy.NewPolicyRepository(),
+		uniqueID:     map[uint64]bool{},
+		nodeMonitor:  monitorLaunch.NewNodeMonitor(),
+
+		// FIXME
+		// The channel size has to be set to the maximum number of
+		// possible endpoints to guarantee that enqueueing into the
+		// build queue never blocks.
+		buildEndpointChan: make(chan *endpoint.Request, lxcmap.MaxEntries),
+		compilationMutex:  new(lock.RWMutex),
 	}
 
-	// Create the same amount of worker threads as there are CPUs
-	d.StartEndpointBuilders(runtime.NumCPU())
+	workloads.Init(&d)
 
-	d.listenForCiliumEvents()
+	// Clear previous leftovers before listening for new requests
+	log.Info("Clearing leftover Cilium veths")
+	err := d.clearCiliumVeths()
+	if err != nil {
+		log.WithError(err).Debug("Unable to clean leftover veths")
+	}
 
-	if c.IsK8sEnabled() {
-		d.k8sClient, err = k8s.CreateClient(c.K8sEndpoint, c.K8sCfgPath)
-		if err != nil {
-			return nil, err
+	// Create at least 4 worker threads or the same amount as there are
+	// CPUs.
+	log.Info("Launching endpoint builder workers")
+	d.StartEndpointBuilders(numWorkerThreads())
+
+	if k8s.IsEnabled() {
+		if err := k8s.Init(); err != nil {
+			log.WithError(err).Fatal("Unable to initialize Kubernetes subsystem")
 		}
 
-		if nodeName := os.Getenv(k8s.EnvNodeNameSpec); nodeName != "" {
-			// Try to retrieve node's cidr from k8s's configuration
-			if err := d.useK8sNodeCIDR(nodeName); err != nil {
-				return nil, err
-			}
+		// Kubernetes demands that the localhost can always reach local
+		// pods. Therefore unless the AllowLocalhost policy is set to a
+		// specific mode, always allow localhost to reach local
+		// endpoints.
+		if option.Config.AlwaysAllowLocalhost() {
+			log.Info("k8s mode: Allowing localhost to reach local endpoints")
+		}
+
+		if !singleClusterRoute {
+			node.EnablePerNodeRoutes()
+		}
+	}
+
+	// If the device has been specified, the IPv4AllocPrefix and the
+	// IPv6AllocPrefix were already allocated before the k8s.Init().
+	//
+	// If the device hasn't been specified, k8s.Init() allocated the
+	// IPv4AllocPrefix and the IPv6AllocPrefix from k8s node annotations.
+	//
+	// Then, we will calculate the IPv4 or IPv6 alloc prefix based on the IPv6
+	// or IPv4 alloc prefix, respectively, retrieved by k8s node annotations.
+	log.Info("Initializing node addressing")
+	if option.Config.Device == "undefined" {
+		node.InitDefaultPrefix("")
+	}
+
+	node.SetIPv4ClusterCidrMaskSize(v4ClusterCidrMaskSize)
+
+	if v4Prefix != AutoCIDR {
+		_, net, err := net.ParseCIDR(v4Prefix)
+		if err != nil {
+			log.WithError(err).WithField(logfields.V4Prefix, v4Prefix).Fatal("Invalid IPv4 allocation prefix")
+		}
+		node.SetIPv4AllocRange(net)
+	}
+
+	if v4ServicePrefix != AutoCIDR {
+		_, ipnet, err := net.ParseCIDR(v4ServicePrefix)
+		if err != nil {
+			log.WithError(err).WithField(logfields.V4Prefix, v4ServicePrefix).Fatal("Invalid IPv4 service prefix")
+		}
+
+		node.AddAuxPrefix(ipnet)
+	}
+
+	if v6Prefix != AutoCIDR {
+		_, net, err := net.ParseCIDR(v6Prefix)
+		if err != nil {
+			log.WithError(err).WithField(logfields.V6Prefix, v6ServicePrefix).Fatal("Invalid IPv6 allocation prefix")
+		}
+
+		if err := node.SetIPv6NodeRange(net); err != nil {
+			log.WithError(err).WithField(logfields.V6Prefix, net).Fatal("Invalid per node IPv6 allocation prefix")
+		}
+	}
+
+	if v6ServicePrefix != AutoCIDR {
+		_, ipnet, err := net.ParseCIDR(v6ServicePrefix)
+		if err != nil {
+			log.WithError(err).WithField(logfields.V6Prefix, v6ServicePrefix).Fatal("Invalid IPv6 service prefix")
+		}
+
+		node.AddAuxPrefix(ipnet)
+	}
+
+	if err := node.AutoComplete(); err != nil {
+		log.WithError(err).Fatal("Cannot autocomplete node IPv6 address")
+	}
+
+	if k8s.IsEnabled() {
+		log.Info("Annotating k8s node with CIDR ranges")
+		err := k8s.AnnotateNode(k8s.Client(), node.GetName(),
+			node.GetIPv4AllocRange(), node.GetIPv6NodeRange(),
+			nil, nil)
+		if err != nil {
+			log.WithError(err).Warning("Cannot annotate k8s node with CIDR range")
 		}
 	}
 
 	// Set up ipam conf after init() because we might be running d.conf.KVStoreIPv4Registration
-	if d.ipamConf, err = d.conf.createIPAMConf(); err != nil {
-		return nil, err
+	log.Info("Initializing IPAM")
+	if err = ipam.Init(); err != nil {
+		log.WithError(err).Fatal("IPAM init failed")
 	}
 
-	if !d.conf.IPv4Disabled {
+	log.Info("Validating configured node address ranges")
+	if err := node.ValidatePostInit(); err != nil {
+		log.WithError(err).Fatal("postinit failed")
+	}
+	log.Info("Addressing information:")
+	log.Infof("  Local node-name: %s", node.GetName())
+	log.Infof("  Node-IPv6: %s", node.GetIPv6())
+	log.Infof("  External-Node IPv4: %s", node.GetExternalIPv4())
+	log.Infof("  Internal-Node IPv4: %s", node.GetInternalIPv4())
+	log.Infof("  Cluster IPv6 prefix: %s", node.GetIPv6ClusterRange())
+	log.Infof("  Cluster IPv4 prefix: %s", node.GetIPv4ClusterRange())
+	log.Infof("  IPv6 node prefix: %s", node.GetIPv6NodeRange())
+	log.Infof("  IPv6 allocation prefix: %s", node.GetIPv6AllocRange())
+	log.Infof("  IPv4 allocation prefix: %s", node.GetIPv4AllocRange())
+	log.Infof("  IPv6 router address: %s", node.GetIPv6Router())
+
+	if !option.Config.IPv4Disabled {
 		// Allocate IPv4 service loopback IP
-		loopbackIPv4, err := d.ipamConf.IPv4Allocator.AllocateNext()
+		loopbackIPv4, _, err := ipam.AllocateNext("ipv4")
 		if err != nil {
 			return nil, fmt.Errorf("Unable to reserve IPv4 loopback address: %s", err)
 		}
 		d.loopbackIPv4 = loopbackIPv4
+		log.Infof("  Loopback IPv4: %s", d.loopbackIPv4.String())
 	}
 
+	// Populate list of nodes with local node entry
+	log.Info("Adding local node to local cluster node list")
+	ni, n := node.GetLocalNode()
+	node.UpdateNode(ni, n, node.TunnelRoute, nil)
+
+	// This needs to be done after the node addressing has been configured
+	// as the node address is required as sufix
+	identity.InitIdentityAllocator(&d)
+
 	if err = d.init(); err != nil {
-		log.Errorf("Error while initializing daemon: %s\n", err)
+		log.WithError(err).Error("Error while initializing daemon")
 		return nil, err
 	}
 
-	// FIXME: Make configurable
-	d.l7Proxy = proxy.NewProxy(10000, 20000)
+	// Start watcher for endpoint IP --> identity mappings in key-value store.
+	// this needs to be done *after* init() for the daemon in that function,
+	// we populate the IPCache with the host's IP(s).
+	ipcache.InitIPIdentityWatcher(d.ipcacheListeners)
 
-	if c.RestoreState {
-		if err := d.SyncState(d.conf.StateDir, true); err != nil {
-			log.Warningf("Error while recovering endpoints: %s\n", err)
+	// FIXME: Make the port range configurable.
+	d.l7Proxy = proxy.StartProxySupport(10000, 20000, option.Config.RunDir,
+		option.Config.AccessLog, &d, option.Config.AgentLabels)
+
+	if option.Config.RestoreState {
+		log.Info("Restoring state...")
+		if err := d.SyncState(option.Config.StateDir, true); err != nil {
+			log.WithError(err).Warn("Error while recovering endpoints")
 		}
-		if err := d.SyncLBMap(); err != nil {
-			log.Warningf("Error while recovering endpoints: %s\n", err)
-		}
+		go func() {
+			if err := d.SyncLBMap(); err != nil {
+				log.WithError(err).Warn("Error while recovering endpoints")
+			}
+		}()
 	} else {
+		log.Info("No previous state to restore. Cilium will not manage existing containers")
 		// We need to read all docker containers so we know we won't
 		// going to allocate the same IP addresses and we will ignore
 		// these containers from reading.
-		d.IgnoreRunningContainers()
+		containerd.IgnoreRunningContainers()
 	}
 
 	d.collectStaleMapGarbage()
 
+	// Allocate health endpoint IPs after restoring state
+	log.Info("Building health endpoint")
+	health4, health6, err := ipam.AllocateNext("")
+	if err != nil {
+		log.WithError(err).Fatal("Error while allocating cilium-health IP")
+	}
+	node.SetIPv4HealthIP(health4)
+	node.SetIPv6HealthIP(health6)
+	log.Debugf("IPv4 health endpoint address: %s", node.GetIPv4HealthIP())
+	log.Debugf("IPv6 health endpoint address: %s", node.GetIPv6HealthIP())
+
+	d.startStatusCollector()
+
 	return &d, nil
 }
 
-func (d *Daemon) collectStaleMapGarbage() {
-	d.endpointsMU.RLock()
-	defer d.endpointsMU.RUnlock()
+func (d *Daemon) validateExistingMaps() error {
+	walker := func(path string, _ os.FileInfo, _ error) error {
+		return mapValidateWalker(path)
+	}
 
+	return filepath.Walk(bpf.MapPrefixPath(), walker)
+}
+
+func (d *Daemon) collectStaleMapGarbage() {
 	walker := func(path string, _ os.FileInfo, _ error) error {
 		return d.staleMapWalker(path)
 	}
 
 	if err := filepath.Walk(bpf.MapPrefixPath(), walker); err != nil {
-		log.Warningf("Error while scanning for stale maps: %s", err)
+		log.WithError(err).Warn("Error while scanning for stale maps")
 	}
 }
 
 func (d *Daemon) removeStaleMap(path string) {
 	if err := os.RemoveAll(path); err != nil {
-		log.Warningf("Error while deleting stale map file %s: %s", path, err)
+		log.WithError(err).WithField(logfields.Path, path).Warn("Error while deleting stale map file")
 	} else {
-		log.Infof("Removed stale bpf map %s", path)
+		log.WithField(logfields.Path, path).Info("Removed stale bpf map")
 	}
 }
 
-// call with d.endpointsMU.RLocked
+func (d *Daemon) removeStaleIDFromPolicyMap(id uint32) {
+	gpm, err := policymap.OpenGlobalMap(bpf.MapPath(endpoint.PolicyGlobalMapName))
+	if err == nil {
+		gpm.Delete(id, policymap.AllPorts, u8proto.All, policymap.Ingress)
+		gpm.Delete(id, policymap.AllPorts, u8proto.All, policymap.Egress)
+		gpm.Close()
+	}
+}
+
 func (d *Daemon) checkStaleMap(path string, filename string, id string) {
 	if tmp, err := strconv.ParseUint(id, 0, 16); err == nil {
-		if _, ok := d.endpoints[uint16(tmp)]; !ok {
+		if ep := endpointmanager.LookupCiliumID(uint16(tmp)); ep == nil {
+			d.removeStaleIDFromPolicyMap(uint32(tmp))
 			d.removeStaleMap(path)
 		}
 	}
 }
 
-// call with d.endpointsMU.RLocked
 func (d *Daemon) checkStaleGlobalMap(path string, filename string) {
-	var globalCTinUse = false
-
-	for k := range d.endpoints {
-		e := d.endpoints[k]
-		if e.Consumable != nil &&
-			e.Opts.IsDisabled(endpoint.OptionConntrackLocal) {
-			globalCTinUse = true
-			break
-		}
-	}
+	globalCTinUse := endpointmanager.HasGlobalCT()
 
 	if !globalCTinUse &&
 		(filename == ctmap.MapName6Global ||
@@ -676,7 +1240,6 @@ func (d *Daemon) checkStaleGlobalMap(path string, filename string) {
 	}
 }
 
-// call with d.endpointsMU.RLocked
 func (d *Daemon) staleMapWalker(path string) error {
 	filename := filepath.Base(path)
 
@@ -684,6 +1247,7 @@ func (d *Daemon) staleMapWalker(path string) error {
 		policymap.MapName,
 		ctmap.MapName6,
 		ctmap.MapName4,
+		endpoint.CallsMapName,
 	}
 
 	d.checkStaleGlobalMap(path, filename)
@@ -699,7 +1263,40 @@ func (d *Daemon) staleMapWalker(path string) error {
 	return nil
 }
 
+func mapValidateWalker(path string) error {
+	prefixToValidator := map[string]bpf.MapValidator{
+		policymap.MapName: policymap.Validate,
+	}
+
+	filename := filepath.Base(path)
+	for m, validate := range prefixToValidator {
+		if strings.HasPrefix(filename, m) {
+			valid, err := validate(path)
+			switch {
+			case err != nil:
+				return err
+			case !valid:
+				log.WithField(logfields.Path, filename).Info("Outdated non-persistent BPF map found, removing...")
+
+				if err := os.Remove(path); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
 func changedOption(key string, value bool, data interface{}) {
+	d := data.(*Daemon)
+	if key == option.Debug {
+		// Set the debug toggle (this can be a no-op)
+		logging.ToggleDebugLogs(d.DebugEnabled())
+		// Reflect log level change to proxies
+		proxy.ChangeLogLevel(log.Level)
+	}
+	d.policy.BumpRevision() // force policy recalculation
 }
 
 type patchConfig struct {
@@ -711,20 +1308,67 @@ func NewPatchConfigHandler(d *Daemon) PatchConfigHandler {
 }
 
 func (h *patchConfig) Handle(params PatchConfigParams) middleware.Responder {
-	log.Debugf("PATCH /config request: %+v", params)
+	log.WithField(logfields.Params, logfields.Repr(params)).Debug("PATCH /config request")
 
 	d := h.daemon
 
-	if err := d.conf.Opts.Validate(params.Configuration); err != nil {
+	// Serialize configuration updates to the daemon.
+	option.Config.ConfigPatchMutex.Lock()
+	defer option.Config.ConfigPatchMutex.Unlock()
+
+	cfgSpec := params.Configuration
+	nmArgs := d.nodeMonitor.GetArgs()
+	if numPagesEntry, ok := cfgSpec.Options["MonitorNumPages"]; ok && nmArgs[0] != numPagesEntry {
+		if len(nmArgs) == 0 || nmArgs[0] != numPagesEntry {
+			args := []string{"--num-pages %s", numPagesEntry}
+			d.nodeMonitor.Restart(args)
+		}
+		if len(cfgSpec.Options) == 0 {
+			return NewPatchConfigOK()
+		}
+		delete(cfgSpec.Options, "MonitorNumPages")
+	}
+	if err := option.Config.Opts.Validate(cfgSpec.Options); err != nil {
 		return apierror.Error(PatchConfigBadRequestCode, err)
 	}
 
-	changes := d.conf.Opts.Apply(params.Configuration, changedOption, d)
-	log.Debugf("Applied %d changes", changes)
+	// Track changes to daemon's configuration
+	var changes int
+
+	// Only update if value provided for PolicyEnforcement.
+	if enforcement := cfgSpec.PolicyEnforcement; enforcement != "" {
+		switch enforcement {
+		case option.NeverEnforce, option.DefaultEnforcement, option.AlwaysEnforce:
+			// Update policy enforcement configuration if needed.
+			oldEnforcementValue := policy.GetPolicyEnabled()
+
+			// If the policy enforcement configuration has indeed changed, we have
+			// to regenerate endpoints and update daemon's configuration.
+			if enforcement != oldEnforcementValue {
+				log.Debug("configuration request to change PolicyEnforcement for daemon")
+				changes++
+				policy.SetPolicyEnabled(enforcement)
+				d.TriggerPolicyUpdates(true)
+			}
+
+		default:
+			msg := fmt.Errorf("Invalid option for PolicyEnforcement %s", enforcement)
+			log.Warn(msg)
+			return apierror.Error(PatchConfigFailureCode, msg)
+		}
+		log.Debug("finished configuring PolicyEnforcement for daemon")
+	}
+
+	changes += option.Config.Opts.Apply(cfgSpec.Options, changedOption, d)
+
+	log.WithField("count", changes).Debug("Applied changes to daemon's configuration")
+
 	if changes > 0 {
+		// Only recompile if configuration has changed.
+		log.Debug("daemon configuration has changed; recompiling base programs")
 		if err := d.compileBase(); err != nil {
-			msg := fmt.Errorf("Unable to recompile base programs: %s\n", err)
-			log.Warningf("%s", msg)
+			log.WithError(err).Warn("Invalid option for PolicyEnforcement")
+			msg := fmt.Errorf("Unable to recompile base programs: %s", err)
 			return apierror.Error(PatchConfigFailureCode, msg)
 		}
 	}
@@ -733,20 +1377,7 @@ func (h *patchConfig) Handle(params PatchConfigParams) middleware.Responder {
 }
 
 func (d *Daemon) getNodeAddressing() *models.NodeAddressing {
-	addr := d.conf.NodeAddress
-
-	return &models.NodeAddressing{
-		IPV6: &models.NodeAddressingElement{
-			Enabled:    true,
-			IP:         addr.IPv6Address.String(),
-			AllocRange: addr.IPv6AllocRange().String(),
-		},
-		IPV4: &models.NodeAddressingElement{
-			Enabled:    !d.conf.IPv4Disabled,
-			IP:         addr.IPv4Address.String(),
-			AllocRange: addr.IPv4AllocRange().String(),
-		},
-	}
+	return node.GetNodeAddressing(!option.Config.IPv4Disabled)
 }
 
 type getConfig struct {
@@ -758,34 +1389,124 @@ func NewGetConfigHandler(d *Daemon) GetConfigHandler {
 }
 
 func (h *getConfig) Handle(params GetConfigParams) middleware.Responder {
-	log.Debugf("GET /config request: %+v", params)
+	log.WithField(logfields.Params, logfields.Repr(params)).Debug("GET /config request")
 
 	d := h.daemon
 
-	cfg := &models.DaemonConfigurationResponse{
-		Addressing:    d.getNodeAddressing(),
-		Configuration: d.conf.Opts.GetModel(),
+	spec := &models.DaemonConfigurationSpec{
+		Options:           *option.Config.Opts.GetMutableModel(),
+		PolicyEnforcement: policy.GetPolicyEnabled(),
+	}
+
+	status := &models.DaemonConfigurationStatus{
+		Addressing:       d.getNodeAddressing(),
+		K8sConfiguration: k8s.GetKubeconfigPath(),
+		K8sEndpoint:      k8s.GetAPIServer(),
+		NodeMonitor:      d.nodeMonitor.State(),
+		KvstoreConfiguration: &models.KVstoreConfiguration{
+			Type:    kvStore,
+			Options: kvStoreOpts,
+		},
+		Realized: spec,
+	}
+
+	cfg := &models.DaemonConfiguration{
+		Spec:   spec,
+		Status: status,
 	}
 
 	return NewGetConfigOK().WithPayload(cfg)
 }
 
-func (d *Daemon) IgnoredContainer(id string) bool {
-	d.ignoredMutex.RLock()
-	_, ok := d.ignoredContainers[id]
-	d.ignoredMutex.RUnlock()
-
-	return ok
+// listFilterIfs returns a map of interfaces based on the given filter.
+// The filter should take a link and, if found, return the index of that
+// interface, if not found return -1.
+func listFilterIfs(filter func(netlink.Link) int) (map[int]netlink.Link, error) {
+	ifs, err := netlink.LinkList()
+	if err != nil {
+		return nil, err
+	}
+	vethLXCIdxs := map[int]netlink.Link{}
+	for _, intf := range ifs {
+		if idx := filter(intf); idx != -1 {
+			vethLXCIdxs[idx] = intf
+		}
+	}
+	return vethLXCIdxs, nil
 }
 
-func (d *Daemon) StartIgnoringContainer(id string) {
-	d.ignoredMutex.Lock()
-	d.ignoredContainers[id]++
-	d.ignoredMutex.Unlock()
+// clearCiliumVeths checks all veths created by cilium and removes all that
+// are considered a leftover from failed attempts to connect the container.
+func (d *Daemon) clearCiliumVeths() error {
+
+	leftVeths, err := listFilterIfs(func(intf netlink.Link) int {
+		// Filter by veth and return the index of the interface.
+		if intf.Type() == "veth" {
+			return intf.Attrs().Index
+		}
+		return -1
+	})
+
+	if err != nil {
+		return fmt.Errorf("unable to retrieve host network interfaces: %s", err)
+	}
+
+	for _, v := range leftVeths {
+		peerIndex := v.Attrs().ParentIndex
+		parentVeth, found := leftVeths[peerIndex]
+		if found && peerIndex != 0 && strings.HasPrefix(parentVeth.Attrs().Name, "lxc") {
+			err := netlink.LinkDel(v)
+			if err != nil {
+				fmt.Printf(`CleanVeths: Unable to delete leftover veth "%d %s": %s`,
+					v.Attrs().Index, v.Attrs().Name, err)
+			}
+		}
+	}
+	return nil
 }
 
-func (d *Daemon) StopIgnoringContainer(id string) {
-	d.ignoredMutex.Lock()
-	delete(d.ignoredContainers, id)
-	d.ignoredMutex.Unlock()
+// numWorkerThreads returns the number of worker threads with a minimum of 4.
+func numWorkerThreads() int {
+	ncpu := runtime.NumCPU()
+	minWorkerThreads := 4
+
+	if ncpu < minWorkerThreads {
+		return minWorkerThreads
+	}
+	return ncpu
+}
+
+// GetServiceList returns list of services
+func (d *Daemon) GetServiceList() []*models.Service {
+	list := []*models.Service{}
+
+	d.loadBalancer.BPFMapMU.RLock()
+	defer d.loadBalancer.BPFMapMU.RUnlock()
+
+	for _, v := range d.loadBalancer.SVCMap {
+		list = append(list, v.GetModel())
+	}
+	return list
+}
+
+// SendNotification sends an agent notification to the monitor
+func (d *Daemon) SendNotification(typ monitor.AgentNotification, text string) error {
+	event := monitor.AgentNotify{Type: typ, Text: text}
+	return d.nodeMonitor.SendEvent(monitor.MessageTypeAgent, event)
+}
+
+// NewProxyLogRecord is invoked by the proxy accesslog on each new access log entry
+func (d *Daemon) NewProxyLogRecord(l *logger.LogRecord) error {
+	return d.nodeMonitor.SendEvent(monitor.MessageTypeAccessLog, l.LogRecord)
+}
+
+// GetNodeSuffix returns the suffix to be appended to kvstore keys of this
+// agent
+func (d *Daemon) GetNodeSuffix() string {
+	if ip := node.GetExternalIPv4(); ip != nil {
+		return ip.String()
+	}
+
+	log.Fatal("Node IP not available yet")
+	return "<nil>"
 }

@@ -20,17 +20,29 @@ import (
 )
 
 // ConfigGet returns a daemon configuration.
-func (c *Client) ConfigGet() (*models.DaemonConfigurationResponse, error) {
+func (c *Client) ConfigGet() (*models.DaemonConfiguration, error) {
 	resp, err := c.Daemon.GetConfig(nil)
 	if err != nil {
-		return nil, err
+		return nil, Hint(err)
 	}
 	return resp.Payload, nil
 }
 
 // ConfigPatch modifies the daemon configuration.
-func (c *Client) ConfigPatch(cfg models.ConfigurationMap) error {
-	params := daemon.NewPatchConfigParams().WithConfiguration(cfg)
-	_, err := c.Daemon.PatchConfig(params)
-	return err
+func (c *Client) ConfigPatch(cfg models.DaemonConfigurationSpec) error {
+	fullCfg, err := c.ConfigGet()
+	if err != nil {
+		return err
+	}
+
+	for opt, value := range cfg.Options {
+		fullCfg.Spec.Options[opt] = value
+	}
+	if cfg.PolicyEnforcement != "" {
+		fullCfg.Spec.PolicyEnforcement = cfg.PolicyEnforcement
+	}
+
+	params := daemon.NewPatchConfigParams().WithConfiguration(fullCfg.Spec)
+	_, err = c.Daemon.PatchConfig(params)
+	return Hint(err)
 }

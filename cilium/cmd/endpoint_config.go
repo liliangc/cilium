@@ -16,8 +16,9 @@ package cmd
 
 import (
 	"fmt"
+	"os"
 
-	"github.com/cilium/cilium/api/v1/models"
+	"github.com/cilium/cilium/pkg/command"
 	"github.com/cilium/cilium/pkg/endpoint"
 	"github.com/cilium/cilium/pkg/option"
 
@@ -30,7 +31,7 @@ var listOptions bool
 var endpointConfigCmd = &cobra.Command{
 	Use:     "config <endpoint id> [<option>=(enable|disable) ...]",
 	Short:   "View & modify endpoint configuration",
-	Example: "endpoint config 5421 DropNotification=disable",
+	Example: "endpoint config 5421 DropNotification=false TraceNotification=false",
 	Run: func(cmd *cobra.Command, args []string) {
 		if listOptions {
 			listEndpointOptions()
@@ -45,10 +46,11 @@ var endpointConfigCmd = &cobra.Command{
 func init() {
 	endpointCmd.AddCommand(endpointConfigCmd)
 	endpointConfigCmd.Flags().BoolVarP(&listOptions, "list-options", "", false, "List available options")
+	command.AddJSONOutput(endpointConfigCmd)
 }
 
 func listEndpointOptions() {
-	for k, s := range endpoint.EndpointOptionLibrary {
+	for k, s := range endpoint.EndpointMutableOptionLibrary {
 		fmt.Printf("%-24s %s\n", k, s.Description)
 	}
 }
@@ -62,27 +64,34 @@ func configEndpoint(cmd *cobra.Command, args []string) {
 
 	opts := args[1:]
 	if len(opts) == 0 {
+		if command.OutputJSON() {
+			if err := command.PrintOutput(cfg); err != nil {
+				os.Exit(1)
+			}
+			return
+		}
+
 		dumpConfig(cfg.Immutable)
-		dumpConfig(cfg.Mutable)
+		dumpConfig(cfg.Realized.Options)
 		return
 	}
 
-	epOpts := make(models.ConfigurationMap, len(opts))
-
+	// modify the configuration we fetched directly since we don't need it
+	modifiedOptsCfg := cfg.Realized
 	for k := range opts {
-		name, value, err := option.ParseOption(opts[k], &endpoint.EndpointOptionLibrary)
+		name, value, err := option.ParseOption(opts[k], &endpoint.EndpointMutableOptionLibrary)
 		if err != nil {
 			Fatalf("Cannot parse option %s: %s", opts[k], err)
 		}
 
 		if value {
-			epOpts[name] = "enabled"
+			modifiedOptsCfg.Options[name] = "enabled"
 		} else {
-			epOpts[name] = "disabled"
+			modifiedOptsCfg.Options[name] = "disabled"
 		}
 	}
 
-	err = client.EndpointConfigPatch(id, epOpts)
+	err = client.EndpointConfigPatch(id, modifiedOptsCfg)
 	if err != nil {
 		Fatalf("Cannot update endpoint %s: %s", id, err)
 	}

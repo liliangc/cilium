@@ -12,7 +12,7 @@ function cleanup {
 
 trap cleanup EXIT
 
-cilium policy delete root 2> /dev/null && true
+cilium policy delete --all 2> /dev/null && true
 
 desc "Demo: Create network, attach container, import policy"
 desc ""
@@ -26,11 +26,10 @@ run "docker network create --ipv6 --subnet ::1/112 --driver cilium --ipam-driver
 
 desc "Policy enforcement is disabled by default, enable it."
 desc "Policy enforcement is also enabled as soon as you load a policy into the daemon."
-run "cilium config Policy=true"
+run "cilium config PolicyEnforcement=always"
 
 desc "Start a container with label $SERVER_LABEL"
 run "docker run -d --net cilium --name server -l $SERVER_LABEL tgraf/netperf"
-sleep 3
 
 desc "List local endpoints"
 run "cilium endpoint list"
@@ -66,7 +65,7 @@ run "docker exec -ti client ping6 -c 4 $SERVER_IP"
 
 desc "Show policy table of server container"
 desc "The table maintains a packets/bytes counter for each allowed consumer"
-run "sudo cilium bpf policy list $SERVER_ID"
+run "sudo cilium bpf policy get $SERVER_ID"
 
 desc "Policies are directional and stateful, allowing client->server does not"
 desc "automatically allow the reverse direction server->client. Only reply"

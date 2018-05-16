@@ -21,10 +21,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cilium/cilium/pkg/endpointmanager"
+	"github.com/cilium/cilium/pkg/identity"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/maps/policymap"
-	"github.com/cilium/cilium/pkg/policy"
 )
 
+// LogstashStat is used to collect stats from the policy dumps.
 type LogstashStat struct {
 	FromID  uint32
 	From    string
@@ -37,24 +40,27 @@ type LogstashStat struct {
 func newLogstashClient(addr string) net.Conn {
 	i := 3
 	for {
+		scopedLog := log.WithField(logfields.IPAddr, addr)
+
 		c, err := net.Dial("tcp", addr)
 		if err != nil {
 			if i >= 0 {
-				log.Errorf("Error while connecting to Logstash address %s: %s", addr, err)
+				scopedLog.WithError(err).Error("Error while connecting to Logstash address")
 				if i == 0 {
-					log.Info("Mutting Logstash connection errors but still retrying...")
+					scopedLog.Info("Muting Logstash connection errors but still retrying...")
 				}
 				i--
 			}
 		} else {
-			log.Infof("Connection to Logstash %s successfully made", addr)
+			scopedLog.Info("Connection to Logstash successfully made")
 			return c
 		}
 		time.Sleep(10 * time.Second)
 	}
 }
 
-func (d *Daemon) EnableLogstash(LogstashAddr string, refreshTime int) {
+// EnableLogstash is used to start collecting statistics with Logstash.
+func EnableLogstash(LogstashAddr string, refreshTime int) {
 	readStats := func(c net.Conn) {
 		defer func() {
 			recover()
@@ -63,21 +69,21 @@ func (d *Daemon) EnableLogstash(LogstashAddr string, refreshTime int) {
 			timeToProcess1 := time.Now()
 
 			allPes := map[uint16][]policymap.PolicyEntryDump{}
-			d.endpointsMU.RLock()
-			for _, ep := range d.endpoints {
+			eps := endpointmanager.GetEndpoints()
+			for _, ep := range eps {
 				ep.Mutex.RLock()
 				pes, err := ep.PolicyMap.DumpToSlice()
 				if err != nil {
+					ep.Mutex.RUnlock()
 					continue
 				}
 				allPes[ep.ID] = pes
 				ep.Mutex.RUnlock()
 			}
-			d.endpointsMU.RUnlock()
-			lss := d.processStats(allPes)
+			lss := processStats(allPes)
 			for _, ls := range lss {
 				if err := json.NewEncoder(c).Encode(ls); err != nil {
-					log.Errorf("Error while sending data to Logstash: %s", err)
+					log.WithError(err).Error("Error while sending data to Logstash")
 					timeToProcess2 := time.Now()
 					time.Sleep(time.Second*time.Duration(refreshTime) - timeToProcess2.Sub(timeToProcess1))
 					return
@@ -94,11 +100,12 @@ func (d *Daemon) EnableLogstash(LogstashAddr string, refreshTime int) {
 	}
 }
 
-func (d *Daemon) getInlineLabelStr(id policy.NumericIdentity) string {
-	l, err := d.GetCachedLabelList(id)
-	if err != nil {
+func getInlineLabelStr(id identity.NumericIdentity) string {
+	lbls := identity.LookupIdentityByID(id)
+	if lbls == nil {
 		return ""
 	}
+	l := lbls.Labels.ToSlice()
 	inlineLblSlice := []string{}
 	for _, lbl := range l {
 		inlineLblSlice = append(inlineLblSlice, lbl.String())
@@ -106,7 +113,7 @@ func (d *Daemon) getInlineLabelStr(id policy.NumericIdentity) string {
 	return strings.Join(inlineLblSlice, "\n")
 }
 
-func (d *Daemon) processStats(allPes map[uint16][]policymap.PolicyEntryDump) []LogstashStat {
+func processStats(allPes map[uint16][]policymap.PolicyEntryDump) []LogstashStat {
 	lss := []LogstashStat{}
 	for k, v := range allPes {
 		if len(v) == 0 {
@@ -114,8 +121,8 @@ func (d *Daemon) processStats(allPes map[uint16][]policymap.PolicyEntryDump) []L
 		}
 		for _, stat := range v {
 			lss = append(lss, LogstashStat{
-				FromID:  stat.ID,
-				From:    d.getInlineLabelStr(policy.NumericIdentity(stat.ID)),
+				FromID:  stat.Key.Identity,
+				From:    getInlineLabelStr(identity.NumericIdentity(stat.Key.Identity)),
 				ToID:    strconv.FormatUint(uint64(k), 10),
 				Bytes:   stat.Bytes,
 				Packets: stat.Packets,

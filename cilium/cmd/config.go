@@ -17,23 +17,25 @@ package cmd
 import (
 	"fmt"
 	"os"
-	"sort"
+	"strconv"
+	"strings"
 
 	"github.com/cilium/cilium/api/v1/models"
-	"github.com/cilium/cilium/common"
-	"github.com/cilium/cilium/daemon/options"
+	"github.com/cilium/cilium/pkg/command"
 	"github.com/cilium/cilium/pkg/option"
 
 	"github.com/spf13/cobra"
 )
 
+var numPages int
+
 // configCmd represents the config command
 var configCmd = &cobra.Command{
 	Use:   "config [<option>=(enable|disable) ...]",
-	Short: "A brief description of your command",
+	Short: "Cilium configuration options",
 	Run: func(cmd *cobra.Command, args []string) {
 		if listOptions {
-			for k, s := range options.Library {
+			for k, s := range option.DaemonMutableOptionLibrary {
 				fmt.Printf("%-24s %s\n", k, s.Description)
 			}
 			return
@@ -44,44 +46,62 @@ var configCmd = &cobra.Command{
 }
 
 func init() {
-	RootCmd.AddCommand(configCmd)
+	rootCmd.AddCommand(configCmd)
 	configCmd.Flags().BoolVarP(&listOptions, "list-options", "", false, "List available options")
-}
-
-func dumpConfig(Opts map[string]string) {
-	opts := []string{}
-	for k := range Opts {
-		opts = append(opts, k)
-	}
-	sort.Strings(opts)
-
-	for _, k := range opts {
-		if enabled, err := option.NormalizeBool(Opts[k]); err != nil {
-			Fatalf("Invalid option answer %s: %s", Opts[k], err)
-		} else if enabled {
-			fmt.Printf("%-24s %s\n", k, common.Green("Enabled"))
-		} else {
-			fmt.Printf("%-24s %s\n", k, common.Red("Disabled"))
-		}
-	}
+	configCmd.Flags().IntVarP(&numPages, "num-pages", "n", 0, "Number of pages for perf ring buffer. New values have to be > 0")
+	command.AddJSONOutput(configCmd)
 }
 
 func configDaemon(cmd *cobra.Command, opts []string) {
-	if len(opts) == 0 {
-		resp, err := client.ConfigGet()
-		if err != nil {
-			Fatalf("Error while retrieving configuration: %s", err)
-		}
+	dOpts := make(models.ConfigurationMap, len(opts))
 
-		dumpConfig(resp.Configuration.Immutable)
-		dumpConfig(resp.Configuration.Mutable)
+	resp, err := client.ConfigGet()
+	if err != nil {
+		Fatalf("Error while retrieving configuration: %s", err)
+	}
+	if resp.Status == nil {
+		Fatalf("Empty configuration status returned")
+	}
+
+	cfgStatus := resp.Status
+	if numPages > 0 {
+		if cfgStatus.NodeMonitor != nil && numPages != int(cfgStatus.NodeMonitor.Npages) {
+			dOpts["MonitorNumPages"] = strconv.Itoa(numPages)
+		}
+	} else if len(opts) == 0 {
+		if command.OutputJSON() {
+			if err := command.PrintOutput(cfgStatus.Realized.Options); err != nil {
+				os.Exit(1)
+			}
+			return
+		}
+		dumpConfig(cfgStatus.Immutable)
+		dumpConfig(cfgStatus.Realized.Options)
+		fmt.Printf("%-24s %s\n", "k8s-configuration", cfgStatus.K8sConfiguration)
+		fmt.Printf("%-24s %s\n", "k8s-endpoint", cfgStatus.K8sEndpoint)
+		fmt.Printf("%-24s %s\n", "PolicyEnforcement", cfgStatus.Realized.PolicyEnforcement)
+		if cfgStatus.NodeMonitor != nil {
+			fmt.Printf("%-24s %d\n", "MonitorNumPages", cfgStatus.NodeMonitor.Npages)
+		}
 		return
 	}
 
-	dOpts := make(models.ConfigurationMap, len(opts))
+	var cfg models.DaemonConfigurationSpec
 
 	for k := range opts {
-		name, value, err := options.Parse(opts[k])
+
+		// TODO FIXME - this is a hack, and is not clean
+		optionSplit := strings.SplitN(opts[k], "=", 2)
+		if len(optionSplit) < 2 {
+			Fatalf("Improper configuration format provided")
+		}
+		arg := optionSplit[0]
+		if arg == "PolicyEnforcement" {
+			cfg.PolicyEnforcement = optionSplit[1]
+			continue
+		}
+
+		name, value, err := option.ParseDaemonOption(opts[k])
 		if err != nil {
 			fmt.Printf("%s\n", err)
 			os.Exit(1)
@@ -94,7 +114,8 @@ func configDaemon(cmd *cobra.Command, opts []string) {
 		}
 	}
 
-	if err := client.ConfigPatch(dOpts); err != nil {
+	cfg.Options = dOpts
+	if err := client.ConfigPatch(cfg); err != nil {
 		Fatalf("Unable to change agent configuration: %s\n", err)
 	}
 }

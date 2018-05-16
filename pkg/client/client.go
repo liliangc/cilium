@@ -16,14 +16,20 @@ package client
 
 import (
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
+	"text/tabwriter"
+	"time"
 
 	clientapi "github.com/cilium/cilium/api/v1/client"
+	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/daemon/defaults"
+	"github.com/cilium/cilium/pkg/ip"
 
 	runtime_client "github.com/go-openapi/runtime/client"
 	"github.com/go-openapi/strfmt"
@@ -85,7 +91,203 @@ func NewClient(host string) (*Client, error) {
 
 	transport := configureTransport(nil, tmp[0], host)
 	httpClient := &http.Client{Transport: transport}
-	clientTrans := runtime_client.NewWithClient(host, clientapi.DefaultBasePath,
+	clientTrans := runtime_client.NewWithClient(tmp[1], clientapi.DefaultBasePath,
 		clientapi.DefaultSchemes, httpClient)
 	return &Client{*clientapi.New(clientTrans, strfmt.Default)}, nil
+}
+
+// Hint tries to improve the error message displayed to the user.
+func Hint(err error) error {
+	if err == nil {
+		return err
+	}
+	e, _ := url.PathUnescape(err.Error())
+	if strings.Contains(err.Error(), defaults.SockPath) {
+		return fmt.Errorf("%s\nIs the agent running?", e)
+	}
+	return fmt.Errorf("%s", e)
+}
+
+func timeSince(since time.Time) string {
+	out := "never"
+	if !since.IsZero() {
+		// Poor man's implementtion of time.Truncate(). Can be refined
+		// when we rebase to go 1.9
+		t := time.Since(since)
+		t -= t % time.Second
+		out = t.String() + " ago"
+	}
+
+	return out
+}
+
+func stateUnhealthy(state string) bool {
+	return state == models.StatusStateWarning ||
+		state == models.StatusStateFailure
+}
+
+func statusUnhealthy(s *models.Status) bool {
+	if s != nil {
+		return stateUnhealthy(s.State)
+	}
+	return false
+}
+
+// FormatStatusResponseBrief writes a one-line status to the writer. If
+// everything ok, this is "ok", otherwise a message of the form "error in ..."
+func FormatStatusResponseBrief(w io.Writer, sr *models.StatusResponse) {
+	msg := ""
+
+	switch {
+	case statusUnhealthy(sr.Cilium):
+		msg = fmt.Sprintf("cilium: %s", sr.Cilium.Msg)
+	case statusUnhealthy(sr.ContainerRuntime):
+		msg = fmt.Sprintf("container runtime: %s", sr.ContainerRuntime.Msg)
+	case statusUnhealthy(sr.Kvstore):
+		msg = fmt.Sprintf("kvstore: %s", sr.Kvstore.Msg)
+	case sr.Kubernetes != nil && stateUnhealthy(sr.Kubernetes.State):
+		msg = fmt.Sprintf("kubernetes: %s", sr.Kubernetes.Msg)
+	case sr.Cluster != nil && statusUnhealthy(sr.Cluster.CiliumHealth):
+		msg = fmt.Sprintf("cilium-health: %s", sr.Cluster.CiliumHealth.Msg)
+	}
+
+	// Only bother looking at controller failures if everything else is ok
+	if msg == "" {
+		for _, ctrl := range sr.Controllers {
+			if ctrl.Status == nil {
+				continue
+			}
+			if ctrl.Status.LastFailureMsg != "" {
+				msg = fmt.Sprintf("controller %s: %s",
+					ctrl.Name, ctrl.Status.LastFailureMsg)
+				break
+			}
+		}
+	}
+
+	if msg == "" {
+		fmt.Fprintf(w, "OK\n")
+	} else {
+		fmt.Fprintf(w, "error in %s\n", msg)
+	}
+}
+
+// FormatStatusResponse writes a StatusResponse as a string to the writer.
+//
+// The parameters 'allAddresses', 'allControllers', 'allNodes', respectively,
+// cause all details about that aspect of the status to be printed to the
+// terminal. For each of these, if they are false then only a summary will be
+// printed, with perhaps some detail if there are errors.
+func FormatStatusResponse(w io.Writer, sr *models.StatusResponse, allAddresses, allControllers, allNodes, allRedirects bool) {
+	if sr.Kvstore != nil {
+		fmt.Fprintf(w, "KVStore:\t%s\t%s\n", sr.Kvstore.State, sr.Kvstore.Msg)
+	}
+	if sr.ContainerRuntime != nil {
+		fmt.Fprintf(w, "ContainerRuntime:\t%s\t%s\n",
+			sr.ContainerRuntime.State, sr.ContainerRuntime.Msg)
+	}
+	if sr.Kubernetes != nil {
+		fmt.Fprintf(w, "Kubernetes:\t%s\t%s\n", sr.Kubernetes.State, sr.Kubernetes.Msg)
+		if sr.Kubernetes.State != models.K8sStatusStateDisabled {
+			fmt.Fprintf(w, "Kubernetes APIs:\t[\"%s\"]\n", strings.Join(sr.Kubernetes.K8sAPIVersions, "\", \""))
+		}
+	}
+	if sr.Cilium != nil {
+		fmt.Fprintf(w, "Cilium:\t%s\t%s\n", sr.Cilium.State, sr.Cilium.Msg)
+	}
+
+	if nm := sr.NodeMonitor; nm != nil {
+		fmt.Fprintf(w, "NodeMonitor:\tListening for events on %d CPUs with %dx%d of shared memory\n",
+			nm.Cpus, nm.Npages, nm.Pagesize)
+		if nm.Lost != 0 || nm.Unknown != 0 {
+			fmt.Fprintf(w, "\t%d events lost, %d unknown notifications\n", nm.Lost, nm.Unknown)
+		}
+	} else {
+		fmt.Fprintf(w, "NodeMonitor:\tDisabled\n")
+	}
+
+	var localNode *models.NodeElement
+	if sr.Cluster != nil {
+		if sr.Cluster.CiliumHealth != nil {
+			ch := sr.Cluster.CiliumHealth
+			fmt.Fprintf(w, "Cilium health daemon:\t%s\t%s\n", ch.State, ch.Msg)
+		}
+		for _, node := range sr.Cluster.Nodes {
+			if node.Name == sr.Cluster.Self {
+				localNode = node
+			} else {
+				continue
+			}
+		}
+	}
+
+	if sr.IPAM != nil {
+		var v4CIDR, v6CIDR string
+		if localNode != nil {
+			if nIPs := ip.CountIPsInCIDR(localNode.PrimaryAddress.IPV4.AllocRange); nIPs > 0 {
+				v4CIDR = fmt.Sprintf("/%d", nIPs)
+			}
+			if nIPs := ip.CountIPsInCIDR(localNode.PrimaryAddress.IPV6.AllocRange); nIPs > 0 {
+				v6CIDR = fmt.Sprintf("/%d", nIPs)
+			}
+		}
+		fmt.Fprintf(w, "IPv4 address pool:\t%d%s allocated\n", len(sr.IPAM.IPV4), v4CIDR)
+		if allAddresses {
+			for _, ipv4 := range sr.IPAM.IPV4 {
+				fmt.Fprintf(w, "  %s\n", ipv4)
+			}
+		}
+		fmt.Fprintf(w, "IPv6 address pool:\t%d%s allocated\n", len(sr.IPAM.IPV6), v6CIDR)
+		if allAddresses {
+			for _, ipv6 := range sr.IPAM.IPV6 {
+				fmt.Fprintf(w, "  %s\n", ipv6)
+			}
+		}
+	}
+
+	if sr.Controllers != nil {
+		nFailing, out := 0, []string{"  Name\tLast success\tLast error\tCount\tMessage\n"}
+		for _, ctrl := range sr.Controllers {
+			status := ctrl.Status
+			if status == nil {
+				continue
+			}
+
+			if status.ConsecutiveFailureCount > 0 {
+				nFailing++
+			} else if !allControllers {
+				continue
+			}
+
+			failSince := timeSince(time.Time(status.LastFailureTimestamp))
+			successSince := timeSince(time.Time(status.LastSuccessTimestamp))
+
+			err := "no error"
+			if status.LastFailureMsg != "" {
+				err = status.LastFailureMsg
+			}
+
+			out = append(out, fmt.Sprintf("  %s\t%s\t%s\t%d\t%s\t\n",
+				ctrl.Name, successSince, failSince, status.ConsecutiveFailureCount, err))
+		}
+
+		nOK := len(sr.Controllers) - nFailing
+		fmt.Fprintf(w, "Controller Status:\t%d/%d healthy\n", nOK, len(sr.Controllers))
+		if len(out) > 1 {
+			tab := tabwriter.NewWriter(w, 0, 0, 3, ' ', 0)
+			sort.Strings(out)
+			for _, s := range out {
+				fmt.Fprint(tab, s)
+			}
+			tab.Flush()
+		}
+
+	}
+
+	if sr.Proxy != nil {
+		fmt.Fprintf(w, "Proxy Status:\tOK, ip %s, port-range %s\n",
+			sr.Proxy.IP, sr.Proxy.PortRange)
+	} else {
+		fmt.Fprintf(w, "Proxy Status:\tNo managed proxy redirect\n")
+	}
 }

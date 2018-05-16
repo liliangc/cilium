@@ -27,15 +27,18 @@ import (
 	"github.com/cilium/cilium/common/plugins"
 	"github.com/cilium/cilium/pkg/client"
 	endpointPkg "github.com/cilium/cilium/pkg/endpoint"
+	"github.com/cilium/cilium/pkg/lock"
+	"github.com/cilium/cilium/pkg/logging"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 
 	"github.com/docker/libnetwork/drivers/remote/api"
 	lnTypes "github.com/docker/libnetwork/types"
 	"github.com/gorilla/mux"
-	l "github.com/op/go-logging"
+	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
 )
 
-var log = l.MustGetLogger("cilium-docker")
+var log = logging.DefaultLogger
 
 const (
 	// ContainerInterfacePrefix is the container's internal interface name prefix.
@@ -48,8 +51,9 @@ type Driver interface {
 }
 
 type driver struct {
+	mutex       lock.RWMutex
 	client      *client.Client
-	conf        models.DaemonConfigurationResponse
+	conf        models.DaemonConfigurationStatus
 	routes      []api.StaticRoute
 	gatewayIPv6 string
 	gatewayIPv4 string
@@ -75,9 +79,10 @@ func newLibnetworkRoute(route plugins.Route) api.StaticRoute {
 
 // NewDriver creates and returns a new Driver for the given API URL
 func NewDriver(url string) (Driver, error) {
+	scopedLog := log.WithField("url", url)
 	c, err := client.NewClient(url)
 	if err != nil {
-		log.Fatalf("Error while starting cilium-client: %s", err)
+		scopedLog.WithError(err).Fatal("Error while starting cilium-client")
 	}
 
 	d := &driver{client: c}
@@ -85,53 +90,65 @@ func NewDriver(url string) (Driver, error) {
 	for tries := 0; tries < 24; tries++ {
 		if res, err := c.ConfigGet(); err != nil {
 			if tries == 23 {
-				log.Fatalf("Unable to connect to cilium daemon: %s", err)
+				scopedLog.WithError(err).Fatal("Unable to connect to cilium daemon")
 			} else {
-				log.Info("Waiting for cilium daemon to start up...")
+				scopedLog.Info("Waiting for cilium daemon to start up...")
 			}
 			time.Sleep(time.Duration(tries) * time.Second)
 		} else {
-			if res.Addressing == nil || res.Addressing.IPV6 == nil {
-				log.Fatalf("Invalid addressing information from daemon")
+			if res.Status.Addressing == nil || res.Status.Addressing.IPV6 == nil {
+				scopedLog.Fatal("Invalid addressing information from daemon")
 			}
 
-			d.conf = *res
+			d.conf = *res.Status
 			break
 		}
 	}
 
 	if err := plugins.SufficientAddressing(d.conf.Addressing); err != nil {
-		log.Fatalf("%s", err)
+		scopedLog.WithError(err).Fatal("Insufficient addressing")
 	}
 
-	d.routes = []api.StaticRoute{}
-	if d.conf.Addressing.IPV6 != nil {
-		if routes, err := plugins.IPv6Routes(d.conf.Addressing); err != nil {
-			log.Fatalf("Unable to generate IPv6 routes: %s", err)
-		} else {
-			for _, r := range routes {
-				d.routes = append(d.routes, newLibnetworkRoute(r))
-			}
-		}
-
-		d.gatewayIPv6 = plugins.IPv6Gateway(d.conf.Addressing)
-	}
-
-	if d.conf.Addressing.IPV4 != nil {
-		if routes, err := plugins.IPv4Routes(d.conf.Addressing); err != nil {
-			log.Fatalf("Unable to generate IPv4 routes: %s", err)
-		} else {
-			for _, r := range routes {
-				d.routes = append(d.routes, newLibnetworkRoute(r))
-			}
-		}
-
-		d.gatewayIPv4 = plugins.IPv6Gateway(d.conf.Addressing)
-	}
+	d.updateRoutes(nil)
 
 	log.Infof("Cilium Docker plugin ready")
 
 	return d, nil
+}
+
+func (driver *driver) updateRoutes(addressing *models.NodeAddressing) {
+	driver.mutex.Lock()
+	defer driver.mutex.Unlock()
+
+	if addressing != nil {
+		driver.conf.Addressing = addressing
+	}
+
+	driver.routes = []api.StaticRoute{}
+
+	if driver.conf.Addressing.IPV6 != nil {
+		if routes, err := plugins.IPv6Routes(driver.conf.Addressing); err != nil {
+			log.Fatalf("Unable to generate IPv6 routes: %s", err)
+		} else {
+			for _, r := range routes {
+				driver.routes = append(driver.routes, newLibnetworkRoute(r))
+			}
+		}
+
+		driver.gatewayIPv6 = plugins.IPv6Gateway(driver.conf.Addressing)
+	}
+
+	if driver.conf.Addressing.IPV4 != nil {
+		if routes, err := plugins.IPv4Routes(driver.conf.Addressing); err != nil {
+			log.Fatalf("Unable to generate IPv4 routes: %s", err)
+		} else {
+			for _, r := range routes {
+				driver.routes = append(driver.routes, newLibnetworkRoute(r))
+			}
+		}
+
+		driver.gatewayIPv4 = plugins.IPv6Gateway(driver.conf.Addressing)
+	}
 }
 
 // Listen listens for docker requests on a particular set of endpoints on the given
@@ -168,12 +185,15 @@ func (driver *driver) Listen(socket string) error {
 }
 
 func notFound(w http.ResponseWriter, r *http.Request) {
-	log.Warningf("plugin Not found: [ %+v ]", r)
+	log.WithField(logfields.Object, logfields.Repr(r)).Warn("plugin Not found")
 	http.NotFound(w, r)
 }
 
 func sendError(w http.ResponseWriter, msg string, code int) {
-	log.Errorf("%d %s", code, msg)
+	log.WithFields(logrus.Fields{
+		"code": code,
+		"msg":  msg,
+	}).Error("Sending error")
 	http.Error(w, msg, code)
 }
 
@@ -197,7 +217,7 @@ func (driver *driver) handshake(w http.ResponseWriter, r *http.Request) {
 		[]string{"NetworkDriver", "IpamDriver"},
 	})
 	if err != nil {
-		log.Fatalf("handshake encode: %s", err)
+		log.WithError(err).Fatal("handshake encode")
 		sendError(w, "encode error", http.StatusInternalServerError)
 		return
 	}
@@ -209,7 +229,7 @@ func (driver *driver) capabilities(w http.ResponseWriter, r *http.Request) {
 		Scope: "local",
 	})
 	if err != nil {
-		log.Fatalf("capabilities encode: %s", err)
+		log.WithError(err).Fatal("capabilities encode")
 		sendError(w, "encode error", http.StatusInternalServerError)
 		return
 	}
@@ -223,7 +243,7 @@ func (driver *driver) createNetwork(w http.ResponseWriter, r *http.Request) {
 		sendError(w, "Unable to decode JSON payload: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	log.Debugf("Network Create Called: [ %+v ]", create)
+	log.WithField(logfields.Request, logfields.Repr(&create)).Debug("Network Create Called")
 	emptyResponse(w)
 }
 
@@ -233,7 +253,7 @@ func (driver *driver) deleteNetwork(w http.ResponseWriter, r *http.Request) {
 		sendError(w, "Unable to decode JSON payload: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	log.Debugf("Delete network request: %+v", &delete)
+	log.WithField(logfields.Request, logfields.Repr(&delete)).Debug("Delete network request")
 	emptyResponse(w)
 }
 
@@ -252,48 +272,16 @@ func (driver *driver) createEndpoint(w http.ResponseWriter, r *http.Request) {
 		sendError(w, "Unable to decode JSON payload: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	log.Debugf("Create endpoint request: %+v", &create)
+	log.WithField(logfields.Request, logfields.Repr(&create)).Debug("Create endpoint request")
 
 	if create.Interface.Address == "" {
-		log.Warningf("No IPv4 address provided in CreateEndpoint request")
+		log.Warn("No IPv4 address provided in CreateEndpoint request")
 	}
 
 	if create.Interface.AddressIPv6 == "" {
 		sendError(w, "No IPv6 address provided (required)", http.StatusBadRequest)
 		return
 	}
-
-	//	maps := make([]endpoint.PortMap, 0, 32)
-	//
-	//	for key, val := range create.Options {
-	//		switch key {
-	//		case "com.docker.network.portmap":
-	//			var portmap []lnTypes.PortBinding
-	//			if err := json.Unmarshal(val, &portmap); err != nil {
-	//				sendError(w, "Unable to decode JSON payload: "+err.Error(), http.StatusBadRequest)
-	//				return
-	//			}
-	//			log.Debugf("PortBinding: %+v", &portmap)
-	//
-	//			// FIXME: Host IP is ignored for now
-	//			for _, m := range portmap {
-	//				maps = append(maps, endpoint.PortMap{
-	//					From:  m.HostPort,
-	//					To:    m.Port,
-	//					Proto: uint8(m.Proto),
-	//				})
-	//			}
-	//
-	//		case "com.docker.network.endpoint.exposedports":
-	//			var tp []lnTypes.TransportPort
-	//			if err := json.Unmarshal(val, &tp); err != nil {
-	//				sendError(w, "Unable to decode JSON payload: "+err.Error(), http.StatusBadRequest)
-	//				return
-	//			}
-	//			log.Debugf("ExposedPorts: %+v", &tp)
-	//			// TODO: handle exposed ports
-	//		}
-	//	}
 
 	_, err := driver.client.EndpointGet(endpointID(create.EndpointID))
 	if err != nil {
@@ -318,10 +306,10 @@ func (driver *driver) createEndpoint(w http.ResponseWriter, r *http.Request) {
 
 	endpoint := &models.EndpointChangeRequest{
 		ID:               int64(ip6.EndpointID()),
-		State:            models.EndpointStateDisconnected,
+		State:            models.EndpointStateCreating,
 		DockerEndpointID: create.EndpointID,
 		DockerNetworkID:  create.NetworkID,
-		Addressing: &models.EndpointAddressing{
+		Addressing: &models.AddressPair{
 			IPV6: ip6.String(),
 			IPV4: create.Interface.Address,
 		},
@@ -334,7 +322,7 @@ func (driver *driver) createEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Infof("Created new endpoint: endpoint-id=%s", create.EndpointID)
+	log.WithField(logfields.EndpointID, create.EndpointID).Debug("Created new endpoint")
 
 	respIface := &api.EndpointInterface{
 		// Fixme: the lxcmac is an empty string at this point and we only know the
@@ -345,7 +333,7 @@ func (driver *driver) createEndpoint(w http.ResponseWriter, r *http.Request) {
 	resp := &api.CreateEndpointResponse{
 		Interface: respIface,
 	}
-	log.Debugf("Create endpoint response: %+v", resp)
+	log.WithField(logfields.Response, logfields.Repr(resp)).Debug("Create endpoint response")
 	objectResponse(w, resp)
 }
 
@@ -355,10 +343,10 @@ func (driver *driver) deleteEndpoint(w http.ResponseWriter, r *http.Request) {
 		sendError(w, "Could not decode JSON encode payload", http.StatusBadRequest)
 		return
 	}
-	log.Debugf("Delete endpoint request: %+v", &del)
+	log.WithField(logfields.Request, logfields.Repr(&del)).Debug("Delete endpoint request")
 
 	if err := plugins.DelLinkByName(plugins.Endpoint2IfName(del.EndpointID)); err != nil {
-		log.Warningf("Error while deleting link: %s", err)
+		log.WithError(err).Warn("Error while deleting link")
 	}
 
 	emptyResponse(w)
@@ -370,9 +358,9 @@ func (driver *driver) infoEndpoint(w http.ResponseWriter, r *http.Request) {
 		sendError(w, "Could not decode JSON encode payload", http.StatusBadRequest)
 		return
 	}
-	log.Debugf("Endpoint info request: %+v", &info)
+	log.WithField(logfields.Request, logfields.Repr(&info)).Debug("Endpoint info request")
 	objectResponse(w, &api.EndpointInfoResponse{Value: map[string]interface{}{}})
-	log.Debugf("Endpoint info %s", info.EndpointID)
+	log.WithField(logfields.Response, info.EndpointID).Debug("Endpoint info")
 }
 
 func (driver *driver) joinEndpoint(w http.ResponseWriter, r *http.Request) {
@@ -380,11 +368,15 @@ func (driver *driver) joinEndpoint(w http.ResponseWriter, r *http.Request) {
 		j   api.JoinRequest
 		err error
 	)
+
+	driver.mutex.RLock()
+	defer driver.mutex.RUnlock()
+
 	if err := json.NewDecoder(r.Body).Decode(&j); err != nil {
 		sendError(w, "Could not decode JSON encode payload", http.StatusBadRequest)
 		return
 	}
-	log.Debugf("Join request: %+v", &j)
+	log.WithField(logfields.Request, logfields.Repr(&j)).Debug("Join request")
 
 	old, err := driver.client.EndpointGet(endpointID(j.EndpointID))
 	if err != nil {
@@ -392,9 +384,9 @@ func (driver *driver) joinEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Debugf("Existing endpoint: %+v", old)
-	if old.State != models.EndpointStateDisconnected {
-		sendError(w, "Error: endpoint not in disconnected state", http.StatusBadRequest)
+	log.WithField(logfields.Object, old).Debug("Existing endpoint")
+	if old.Status.State != models.EndpointStateCreating {
+		sendError(w, "Error: endpoint not in creating state", http.StatusBadRequest)
 		return
 	}
 
@@ -410,13 +402,13 @@ func (driver *driver) joinEndpoint(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		if err != nil {
 			if err = netlink.LinkDel(veth); err != nil {
-				log.Warningf("failed to clean up veth %q: %s", veth.Name, err)
+				log.WithError(err).WithField(logfields.Veth, veth.Name).Warn("failed to clean up veth")
 			}
 		}
 	}()
 
 	if err = driver.client.EndpointPatch(endpointPkg.NewCiliumID(old.ID), ep); err != nil {
-		log.Errorf("Joining endpoint failed: %s", err)
+		log.WithError(err).Error("Joining endpoint failed")
 		sendError(w, "Unable to connect endpoint to network: "+err.Error(),
 			http.StatusInternalServerError)
 	}
@@ -440,7 +432,7 @@ func (driver *driver) joinEndpoint(w http.ResponseWriter, r *http.Request) {
 	// If empty, it works as expected without docker runtime errors
 	// res.Gateway = plugins.IPv4Gateway(addr)
 
-	log.Debugf("Join response: %+v", res)
+	log.WithField(logfields.Response, logfields.Repr(res)).Debug("Join response")
 	objectResponse(w, res)
 }
 
@@ -450,10 +442,10 @@ func (driver *driver) leaveEndpoint(w http.ResponseWriter, r *http.Request) {
 		sendError(w, "Could not decode JSON encode payload", http.StatusBadRequest)
 		return
 	}
-	log.Debugf("Leave request: %+v", &l)
+	log.WithField(logfields.Request, logfields.Repr(&l)).Debug("Leave request")
 
 	if err := driver.client.EndpointDelete(endpointID(l.EndpointID)); err != nil {
-		log.Warningf("Leaving the endpoint failed: %s", err)
+		log.WithError(err).Warn("Leaving the endpoint failed")
 	}
 
 	emptyResponse(w)

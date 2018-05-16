@@ -1,10 +1,11 @@
 [Unit]
 Description=cilium
-Documentation=https://github.com/cilium/cilium
+Documentation=http://docs.cilium.io
 Requires=docker.service cilium-consul.service cilium-docker.service
 
 [Service]
 Type=simple
+LimitCORE=infinity
 EnvironmentFile=-/etc/sysconfig/cilium
 ExecStart=/usr/bin/cilium-agent $CILIUM_OPTS
 Restart=on-failure

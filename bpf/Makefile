@@ -1,49 +1,81 @@
 include ../Makefile.defs
 
-CLANG_FLAGS := -Iinclude -D__NR_CPUS__=$(shell nproc) -O2 -target bpf -I.
+FLAGS := -Iinclude -I. -D__NR_CPUS__=$(shell nproc) -O2
 
+CLANG_FLAGS :=  ${FLAGS} -target bpf -emit-llvm
 # eBPF verifier enforces unaligned access checks where necessary, so don't
 # let clang complain too early.
 CLANG_FLAGS += -Wall -Werror -Wno-address-of-packed-member -Wno-unknown-warning-option
+LLC_FLAGS   := -march=bpf -mcpu=probe -filetype=obj
 
-BPF = bpf_lxc.o bpf_netdev.o bpf_overlay.o bpf_lb.o
-SCRIPTS = init.sh join_ep.sh run_probes.sh
-LIB := $(shell find ./lib -name '*.h')
+BPF = bpf_lxc.o bpf_netdev.o bpf_overlay.o bpf_lb.o bpf_xdp.o
+SCRIPTS = init.sh join_ep.sh run_probes.sh spawn_netns.sh
+LIB := $(shell find ./ -name '*.h')
 
-CLANG ?= clang
+TARGET=cilium-map-migrate
+
+CLANG  ?= clang
+LLC    ?= llc
+HOSTCC ?= gcc
 
 ifeq ("$(PKG_BUILD)","")
+all: $(BPF) $(TARGET)
 
-all: $(BPF)
+%.o: %.c $(LIB)
+	@$(ECHO_CC)
+	$(QUIET) ${CLANG} ${CLANG_FLAGS} -c $< -o $(patsubst %.o,%.ll,$@)
+	$(QUIET) ${LLC} ${LLC_FLAGS} -o $@ $(patsubst %.o,%.ll,$@)
 
-%.o: %.c
-	${CLANG} ${CLANG_FLAGS} -c $< -o $@
+check:
+	@$(ECHO_CHECK) bpf/*.c
+	$(QUIET) sparse -Wsparse-all ${FLAGS} *.c
+	$(QUIET) $(CLANG) ${CLANG_FLAGS} --analyze *.c
 
 LB_OPTIONS = \
-	-DUNKNOWN \
+	-DSKIP_DEBUG \
 	-DLB_L3 \
 	-DLB_L4 \
 	-DLB_L3 -DLB_L4
 
-bpf_lb.o:
+bpf_lb.o: bpf_lb.c $(LIB)
+	$(QUIET) set -e; \
 	$(foreach OPTS,$(LB_OPTIONS), \
-		${CLANG} ${OPTS} ${CLANG_FLAGS} -c bpf_lb.c -o /dev/null;)
+		$(ECHO_CC) " [$(OPTS)]"; \
+		${CLANG} ${OPTS} ${CLANG_FLAGS} -c $< -o $(patsubst %.o,%.ll,$@); \
+		${LLC} ${LLC_FLAGS} -o /dev/null $(patsubst %.o,%.ll,$@); )
+	@$(ECHO_CC)
+	$(QUIET) ${CLANG} ${CLANG_FLAGS} -c $< -o $(patsubst %.o,%.ll,$@)
+	$(QUIET) ${LLC} ${LLC_FLAGS} -o $@ $(patsubst %.o,%.ll,$@)
 
 LXC_OPTIONS = \
-	 -DUNKNOWN \
-	 -DDROP_ALL
+	 -DSKIP_DEBUG \
+	 -DDROP_ALL \
+	 -DHAVE_LPM_MAP_TYPE \
+	 -DSKIP_CIDR_PREFIXES
+	# FIXME: GH-2906: Test with both HAVE_LPM_MAP_TYPE and SKIP_CIDR_PREFIXES
 
-bpf_lxc.o:
+bpf_lxc.o: bpf_lxc.c $(LIB)
+	$(QUIET) set -e; \
 	$(foreach OPTS,$(LXC_OPTIONS), \
-		${CLANG} ${OPTS} ${CLANG_FLAGS} -c bpf_lxc.c -o /dev/null;)
-
+		$(ECHO_CC) " [$(OPTS)]"; \
+		${CLANG} ${OPTS} ${CLANG_FLAGS} -c $< -o $(patsubst %.o,%.ll,$@); \
+		${LLC} ${LLC_FLAGS} -o /dev/null $(patsubst %.o,%.ll,$@); )
+	@$(ECHO_CC)
+	$(QUIET) ${CLANG} ${CLANG_FLAGS} -c $< -o $(patsubst %.o,%.ll,$@)
+	$(QUIET) ${LLC} ${LLC_FLAGS} -o $@ $(patsubst %.o,%.ll,$@)
 else
-
-all:
-
+all: $(TARGET)
 endif
 
+$(TARGET): $(TARGET).c
+	@$(ECHO_CC)
+	@# Due to gcc bug, -lelf needs to be at the end.
+	$(QUIET) ${HOSTCC} -Wall -O2 -I include/ $@.c -lelf -o $@
+
 install:
+	$(INSTALL) -m 0755 $(TARGET) $(DESTDIR)$(BINDIR)
 
 clean:
-	rm -fr *.o
+	@$(ECHO_CLEAN) $(notdir $(shell pwd))
+	$(QUIET)rm -fr *.o
+	$(QUIET)rm -f $(TARGET)

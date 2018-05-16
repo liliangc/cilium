@@ -17,19 +17,16 @@ package ctmap
 import (
 	"bytes"
 	"fmt"
+	"math"
+	"net"
 	"unsafe"
 
-	"github.com/cilium/cilium/common"
-	"github.com/cilium/cilium/common/types"
 	"github.com/cilium/cilium/pkg/bpf"
-	"github.com/cilium/cilium/pkg/u8proto"
+	"github.com/cilium/cilium/pkg/byteorder"
+	"github.com/cilium/cilium/pkg/logging"
 )
 
-type CtMap struct {
-	path string
-	Fd   int
-	Type CtType
-}
+var log = logging.DefaultLogger
 
 const (
 	MapName6       = "cilium_ct6_"
@@ -43,363 +40,384 @@ const (
 	TUPLE_F_OUT     = 0
 	TUPLE_F_IN      = 1
 	TUPLE_F_RELATED = 2
+
+	// MaxTime specifies the last possible time for GCFilter.Time
+	MaxTime = math.MaxUint32
+
+	noAction = iota
+	deleteEntry
 )
 
 type CtType int
 
-const (
-	CtTypeIPv6 CtType = iota
-	CtTypeIPv4
-	CtTypeIPv6Global
-	CtTypeIPv4Global
-)
-
+// CtKey is the interface describing keys to the conntrack maps.
 type CtKey interface {
+	bpf.MapKey
+
+	// ToNetwork converts fields to network byte order.
+	ToNetwork() CtKey
+
+	// ToHost converts fields to host byte order.
+	ToHost() CtKey
+
+	// Dumps contents of key to buffer. Returns true if successful.
 	Dump(buffer *bytes.Buffer) bool
 }
 
-type CtKey6 struct {
-	addr    types.IPv6
-	sport   uint16
-	dport   uint16
-	nexthdr u8proto.U8proto
-	flags   uint8
-}
-
-func (key CtKey6) Dump(buffer *bytes.Buffer) bool {
-	if key.nexthdr == 0 {
-		return false
-	}
-
-	if key.flags&TUPLE_F_IN != 0 {
-		buffer.WriteString(fmt.Sprintf("%s IN %s %d:%d ",
-			key.nexthdr.String(),
-			key.addr.IP().String(),
-			key.sport, key.dport),
-		)
-
-	} else {
-		buffer.WriteString(fmt.Sprintf("%s OUT %s %d:%d ",
-			key.nexthdr.String(),
-			key.addr.IP().String(),
-			key.dport,
-			key.sport),
-		)
-	}
-
-	if key.flags&TUPLE_F_RELATED != 0 {
-		buffer.WriteString("related ")
-	}
-
-	return true
-}
-
-type CtKey4 struct {
-	addr    types.IPv4
-	sport   uint16
-	dport   uint16
-	nexthdr u8proto.U8proto
-	flags   uint8
-}
-
-func (key CtKey4) Dump(buffer *bytes.Buffer) bool {
-	if key.nexthdr == 0 {
-		return false
-	}
-
-	if key.flags&TUPLE_F_IN != 0 {
-		buffer.WriteString(fmt.Sprintf("%s IN %s %d:%d ",
-			key.nexthdr.String(),
-			key.addr.IP().String(),
-			key.sport, key.dport),
-		)
-
-	} else {
-		buffer.WriteString(fmt.Sprintf("%s OUT %s %d:%d ",
-			key.nexthdr.String(),
-			key.addr.IP().String(),
-			key.dport,
-			key.sport),
-		)
-	}
-
-	if key.flags&TUPLE_F_RELATED != 0 {
-		buffer.WriteString("related ")
-	}
-
-	return true
-}
-
-type CtKey6Global struct {
-	daddr   types.IPv6
-	saddr   types.IPv6
-	sport   uint16
-	dport   uint16
-	nexthdr u8proto.U8proto
-	flags   uint8
-}
-
-func (key CtKey6Global) Dump(buffer *bytes.Buffer) bool {
-	if key.nexthdr == 0 {
-		return false
-	}
-
-	if key.flags&TUPLE_F_IN != 0 {
-		buffer.WriteString(fmt.Sprintf("%s IN [%s]:%d -> [%s]:%d ",
-			key.nexthdr.String(),
-			key.saddr.IP().String(), key.sport,
-			key.daddr.IP().String(), key.dport),
-		)
-
-	} else {
-		buffer.WriteString(fmt.Sprintf("%s OUT [%s]:%d -> [%s]:%d ",
-			key.nexthdr.String(),
-			key.saddr.IP().String(), key.sport,
-			key.daddr.IP().String(), key.dport),
-		)
-	}
-
-	if key.flags&TUPLE_F_RELATED != 0 {
-		buffer.WriteString("related ")
-	}
-
-	return true
-}
-
-type CtKey4Global struct {
-	daddr   types.IPv4
-	saddr   types.IPv4
-	sport   uint16
-	dport   uint16
-	nexthdr u8proto.U8proto
-	flags   uint8
-}
-
-func (key CtKey4Global) Dump(buffer *bytes.Buffer) bool {
-	if key.nexthdr == 0 {
-		return false
-	}
-
-	if key.flags&TUPLE_F_IN != 0 {
-		buffer.WriteString(fmt.Sprintf("%s IN %s:%d -> %s:%d ",
-			key.nexthdr.String(),
-			key.saddr.IP().String(), key.sport,
-			key.daddr.IP().String(), key.dport),
-		)
-
-	} else {
-		buffer.WriteString(fmt.Sprintf("%s OUT %s%d -> %s:%d ",
-			key.nexthdr.String(),
-			key.saddr.IP().String(), key.sport,
-			key.daddr.IP().String(), key.dport),
-		)
-	}
-
-	if key.flags&TUPLE_F_RELATED != 0 {
-		buffer.WriteString("related ")
-	}
-
-	return true
-}
-
+// CtEntry represents an entry in the connection tracking table.
 type CtEntry struct {
 	rx_packets uint64
 	rx_bytes   uint64
 	tx_packets uint64
 	tx_bytes   uint64
-	lifetime   uint16
+	lifetime   uint32
 	flags      uint16
+	// revnat is in network byte order
 	revnat     uint16
-	proxy_port uint16
+	unused     uint16
+	src_sec_id uint32
 }
 
+// GetValuePtr returns the unsafe.Pointer for s.
+func (c *CtEntry) GetValuePtr() unsafe.Pointer { return unsafe.Pointer(c) }
+
+// String returns the readable format
+func (c *CtEntry) String() string {
+	return fmt.Sprintf("expires=%d rx_packets=%d rx_bytes=%d tx_packets=%d tx_bytes=%d flags=%x revnat=%d src_sec_id=%d\n",
+		c.lifetime,
+		c.rx_packets,
+		c.rx_bytes,
+		c.tx_packets,
+		c.tx_bytes,
+		c.flags,
+		byteorder.NetworkToHost(c.revnat),
+		c.src_sec_id)
+}
+
+// CtEntryDump represents the key and value contained in the conntrack map.
 type CtEntryDump struct {
 	Key   CtKey
 	Value CtEntry
 }
 
-func (m *CtMap) String() string {
-	return m.path
+const (
+	// GCFilterNone doesn't filter the CT entries
+	GCFilterNone = iota
+	// GCFilterByTime filters CT entries by time
+	GCFilterByTime
+)
+
+// GCFilterType is the type of a filter.
+type GCFilterType uint
+
+// GCFilter contains the necessary fields to filter the CT maps.
+// Filtering by endpoint requires both EndpointID to be > 0 and
+// EndpointIP to be not nil.
+type GCFilter struct {
+	Type       GCFilterType
+	Time       uint32
+	EndpointID uint16
+	EndpointIP net.IP
 }
 
-func (m *CtMap) Dump() (string, error) {
+// NewGCFilterBy creates a new GCFilter of the given type.
+func NewGCFilterBy(filterType GCFilterType) *GCFilter {
+	return &GCFilter{
+		Type: filterType,
+	}
+}
+
+// TypeString returns the filter type in human readable way.
+func (f *GCFilter) TypeString() string {
+	switch f.Type {
+	case GCFilterNone:
+		return "none"
+	case GCFilterByTime:
+		return "timeout"
+	default:
+		return "(unknown)"
+	}
+}
+
+// ToString iterates through Map m and writes the values of the ct entries in m
+// to a string.
+func ToString(m *bpf.Map, mapName string) (string, error) {
 	var buffer bytes.Buffer
-	entries, err := m.DumpToSlice()
+	entries, err := dumpToSlice(m, mapName)
 	if err != nil {
 		return "", err
 	}
 	for _, entry := range entries {
-		if !entry.Key.Dump(&buffer) {
+		if !entry.Key.ToHost().Dump(&buffer) {
 			continue
 		}
 
 		value := entry.Value
 		buffer.WriteString(
-			fmt.Sprintf(" expires=%d rx_packets=%d rx_bytes=%d tx_packets=%d tx_bytes=%d flags=%x revnat=%d proxyport=%d\n",
+			fmt.Sprintf(" expires=%d rx_packets=%d rx_bytes=%d tx_packets=%d tx_bytes=%d flags=%x revnat=%d src_sec_id=%d\n",
 				value.lifetime,
 				value.rx_packets,
 				value.rx_bytes,
 				value.tx_packets,
 				value.tx_bytes,
 				value.flags,
-				common.Swab16(value.revnat),
-				common.Swab16(value.proxy_port)),
+				byteorder.NetworkToHost(value.revnat),
+				value.src_sec_id,
+			),
 		)
 
 	}
 	return buffer.String(), nil
 }
 
-func (m *CtMap) DumpToSlice() ([]CtEntryDump, error) {
-	var entry CtEntry
+// DumpToSlice iterates through map m and returns a slice mapping each key to
+// its value in m.
+func dumpToSlice(m *bpf.Map, mapType string) ([]CtEntryDump, error) {
 	entries := []CtEntryDump{}
 
-	switch m.Type {
-	case CtTypeIPv6:
-		var key, nextKey CtKey6
-		for {
-			err := bpf.GetNextKey(m.Fd, unsafe.Pointer(&key), unsafe.Pointer(&nextKey))
-			if err != nil {
-				break
-			}
-
-			err = bpf.LookupElement(
-				m.Fd,
-				unsafe.Pointer(&nextKey),
-				unsafe.Pointer(&entry),
-			)
-			if err != nil {
-				return nil, err
-			}
-
-			eDump := CtEntryDump{Key: nextKey, Value: entry}
-			entries = append(entries, eDump)
-
-			key = nextKey
-		}
-
-	case CtTypeIPv4:
-		var key, nextKey CtKey4
-		for {
-			err := bpf.GetNextKey(m.Fd, unsafe.Pointer(&key), unsafe.Pointer(&nextKey))
-			if err != nil {
-				break
-			}
-
-			err = bpf.LookupElement(
-				m.Fd,
-				unsafe.Pointer(&nextKey),
-				unsafe.Pointer(&entry),
-			)
-			if err != nil {
-				return nil, err
-			}
-
-			eDump := CtEntryDump{Key: nextKey, Value: entry}
-			entries = append(entries, eDump)
-
-			key = nextKey
-		}
-
-	case CtTypeIPv6Global:
+	switch mapType {
+	case MapName6, MapName6Global:
 		var key, nextKey CtKey6Global
 		for {
-			err := bpf.GetNextKey(m.Fd, unsafe.Pointer(&key), unsafe.Pointer(&nextKey))
+			err := m.GetNextKey(&key, &nextKey)
 			if err != nil {
 				break
 			}
 
-			err = bpf.LookupElement(
-				m.Fd,
-				unsafe.Pointer(&nextKey),
-				unsafe.Pointer(&entry),
-			)
+			entry, err := m.Lookup(&nextKey)
 			if err != nil {
 				return nil, err
 			}
+			ctEntry := entry.(*CtEntry)
 
-			eDump := CtEntryDump{Key: nextKey, Value: entry}
+			nK := nextKey
+			eDump := CtEntryDump{Key: &nK, Value: *ctEntry}
 			entries = append(entries, eDump)
 
 			key = nextKey
 		}
 
-	case CtTypeIPv4Global:
+	case MapName4, MapName4Global:
 		var key, nextKey CtKey4Global
 		for {
-			err := bpf.GetNextKey(m.Fd, unsafe.Pointer(&key), unsafe.Pointer(&nextKey))
+			err := m.GetNextKey(&key, &nextKey)
 			if err != nil {
 				break
 			}
 
-			err = bpf.LookupElement(
-				m.Fd,
-				unsafe.Pointer(&nextKey),
-				unsafe.Pointer(&entry),
-			)
+			entry, err := m.Lookup(&nextKey)
 			if err != nil {
 				return nil, err
 			}
+			ctEntry := entry.(*CtEntry)
 
-			eDump := CtEntryDump{Key: nextKey, Value: entry}
+			nK := nextKey
+			eDump := CtEntryDump{Key: &nK, Value: *ctEntry}
 			entries = append(entries, eDump)
 
 			key = nextKey
 		}
 	}
-
 	return entries, nil
 }
 
-func (m *CtMap) doGc(interval uint16, key unsafe.Pointer, nextKey unsafe.Pointer, deleted *int) bool {
-	var entry CtEntry
+// doGC6 iterates through a CTv6 map and drops entries based on the given
+// filter.
+func doGC6(m *bpf.Map, filter *GCFilter) int {
+	var (
+		action, deleted              int
+		prevKey, currentKey, nextKey CtKey6Global
+	)
 
-	err := bpf.GetNextKey(m.Fd, key, nextKey)
+	// prevKey is initially invalid, causing GetNextKey to return the first key in the map as currentKey.
+	prevKeyValid := false
+	err := m.GetNextKey(&prevKey, &currentKey)
 	if err != nil {
-		return false
+		// Map is empty, nothing to clean up.
+		return 0
 	}
 
-	err = bpf.LookupElement(m.Fd, nextKey, unsafe.Pointer(&entry))
-	if err != nil {
-		return false
+	var count uint32
+	for count = 1; count <= m.MapInfo.MaxEntries; count++ {
+		// currentKey was returned by GetNextKey() so we know it existed in the map, but it may have been
+		// deleted by a concurrent map operation. If currentKey is no longer in the map, nextKey will be
+		// the first key in the map again. Use the nextKey only if we still find currentKey in the Lookup()
+		// after the GetNextKey() call, this way we know nextKey is NOT the first key in the map.
+		nextKeyValid := m.GetNextKey(&currentKey, &nextKey)
+		entryMap, err := m.Lookup(&currentKey)
+		if err != nil {
+			// Restarting from a invalid key starts the iteration again from the beginning.
+			// If we have a previously found key, try to restart from there instead
+			if prevKeyValid {
+				currentKey = prevKey
+				// Restart from a given previous key only once, otherwise if the prevKey is
+				// concurrently deleted we might loop forever trying to look it up.
+				prevKeyValid = false
+			} else {
+				// Depending on exactly when currentKey was deleted from the map, nextKey may be the actual
+				// keyelement after the deleted one, or the first element in the map.
+				currentKey = nextKey
+			}
+			continue
+		}
+
+		entry := entryMap.(*CtEntry)
+
+		// In CT entries, the source address of the conntrack entry (`saddr`) is
+		// the destination of the packet received, therefore it's the packet's
+		// destination IP
+		action = filter.doFiltering(currentKey.daddr.IP(), currentKey.saddr.IP(), currentKey.sport,
+			uint8(currentKey.nexthdr), currentKey.flags, entry)
+
+		switch action {
+		case deleteEntry:
+			err := m.Delete(&currentKey)
+			if err != nil {
+				log.WithError(err).Errorf("Unable to delete CT entry %s", currentKey.String())
+			} else {
+				deleted++
+			}
+		}
+
+		if nextKeyValid != nil {
+			break
+		}
+		// remember the last found key
+		prevKey = currentKey
+		prevKeyValid = true
+		// continue from the next key
+		currentKey = nextKey
 	}
 
-	if entry.lifetime <= interval {
-		bpf.DeleteElement(m.Fd, nextKey)
-		(*deleted)++
-	} else {
-		entry.lifetime -= interval
-		bpf.UpdateElement(m.Fd, nextKey, unsafe.Pointer(&entry), 0)
-	}
-
-	return true
-}
-
-func (m *CtMap) GC(interval uint16) int {
-	deleted := 0
-
-	switch m.Type {
-	case CtTypeIPv6:
-		var key, nextKey CtKey6
-		for m.doGc(interval, unsafe.Pointer(&key), unsafe.Pointer(&nextKey), &deleted) {
-			key = nextKey
-		}
-	case CtTypeIPv4:
-		var key, nextKey CtKey4
-		for m.doGc(interval, unsafe.Pointer(&key), unsafe.Pointer(&nextKey), &deleted) {
-			key = nextKey
-		}
-	case CtTypeIPv6Global:
-		var key, nextKey CtKey6Global
-		for m.doGc(interval, unsafe.Pointer(&key), unsafe.Pointer(&nextKey), &deleted) {
-			key = nextKey
-		}
-	case CtTypeIPv4Global:
-		var key, nextKey CtKey4Global
-		for m.doGc(interval, unsafe.Pointer(&key), unsafe.Pointer(&nextKey), &deleted) {
-			key = nextKey
-		}
+	if count > m.MapInfo.MaxEntries {
+		// TODO Add a metric we can bump and observe here.
+		log.WithError(err).Warning("Garbage collection on IPv6 CT map failed to finish")
 	}
 
 	return deleted
+}
+
+// doGC4 iterates through a CTv4 map and drops entries based on the given
+// filter.
+func doGC4(m *bpf.Map, filter *GCFilter) int {
+	var (
+		action, deleted              int
+		prevKey, currentKey, nextKey CtKey4Global
+	)
+
+	// prevKey is initially invalid, causing GetNextKey to return the first key in the map as currentKey.
+	prevKeyValid := false
+	err := m.GetNextKey(&prevKey, &currentKey)
+	if err != nil {
+		// Map is empty, nothing to clean up.
+		return 0
+	}
+
+	var count uint32
+	for count = 1; count <= m.MapInfo.MaxEntries; count++ {
+		// currentKey was returned by GetNextKey() so we know it existed in the map, but it may have been
+		// deleted by a concurrent map operation. If currentKey is no longer in the map, nextKey will be
+		// the first key in the map again. Use the nextKey only if we still find currentKey in the Lookup()
+		// after the GetNextKey() call, this way we know nextKey is NOT the first key in the map.
+		nextKeyValid := m.GetNextKey(&currentKey, &nextKey)
+		entryMap, err := m.Lookup(&currentKey)
+		if err != nil {
+			// Restarting from a invalid key starts the iteration again from the beginning.
+			// If we have a previously found key, try to restart from there instead
+			if prevKeyValid {
+				currentKey = prevKey
+				// Restart from a given previous key only once, otherwise if the prevKey is
+				// concurrently deleted we might loop forever trying to look it up.
+				prevKeyValid = false
+			} else {
+				// Depending on exactly when currentKey was deleted from the map, nextKey may be the actual
+				// keyelement after the deleted one, or the first element in the map.
+				currentKey = nextKey
+			}
+			continue
+		}
+
+		entry := entryMap.(*CtEntry)
+
+		// In CT entries, the source address of the conntrack entry (`saddr`) is
+		// the destination of the packet received, therefore it's the packet's
+		// destination IP
+		action = filter.doFiltering(currentKey.daddr.IP(), currentKey.saddr.IP(), currentKey.sport,
+			uint8(currentKey.nexthdr), currentKey.flags, entry)
+
+		switch action {
+		case deleteEntry:
+			err := m.Delete(&currentKey)
+			if err != nil {
+				log.WithError(err).Errorf("Unable to delete CT entry %s", currentKey.String())
+			} else {
+				deleted++
+			}
+		}
+
+		if nextKeyValid != nil {
+			break
+		}
+		// remember the last found key
+		prevKey = currentKey
+		prevKeyValid = true
+		// continue from the next key
+		currentKey = nextKey
+	}
+
+	if count > m.MapInfo.MaxEntries {
+		// TODO Add a metric we can bump and observe here.
+		log.WithError(err).Warning("Garbage collection on IPv4 CT map failed to finish")
+	}
+
+	return deleted
+}
+
+func (f *GCFilter) doFiltering(srcIP net.IP, dstIP net.IP, dstPort uint16, nextHdr, flags uint8, entry *CtEntry) (action int) {
+	// Delete all entries with a lifetime smaller than f timestamp.
+	if f.Type == GCFilterByTime && entry.lifetime < f.Time {
+		return deleteEntry
+	}
+
+	return noAction
+}
+
+// GC runs garbage collection for map m with name mapName with the given filter.
+// It returns how many items were deleted from m.
+func GC(m *bpf.Map, mapName string, filter *GCFilter) int {
+	if filter.Type == GCFilterByTime {
+		// If LRUHashtable, no need to garbage collect as LRUHashtable cleans itself up.
+		// FIXME: GH-3239 LRU logic is not handling timeouts gracefully enough
+		// if m.MapInfo.MapType == bpf.MapTypeLRUHash {
+		// 	return 0
+		// }
+		t, _ := bpf.GetMtime()
+		tsec := t / 1000000000
+		filter.Time = uint32(tsec)
+	}
+
+	switch mapName {
+	case MapName6, MapName6Global:
+		return doGC6(m, filter)
+	case MapName4, MapName4Global:
+		return doGC4(m, filter)
+	default:
+		return 0
+	}
+}
+
+// Flush runs garbage collection for map m with the name mapName, deleting all
+// entries. The specified map must be already opened using bpf.OpenMap().
+func Flush(m *bpf.Map, mapName string) int {
+	filter := NewGCFilterBy(GCFilterByTime)
+	filter.Time = MaxTime
+
+	switch mapName {
+	case MapName6, MapName6Global:
+		return doGC6(m, filter)
+	case MapName4, MapName4Global:
+		return doGC4(m, filter)
+	default:
+		return 0
+	}
 }

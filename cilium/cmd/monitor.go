@@ -17,23 +17,35 @@ package cmd
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/gob"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"os/signal"
-	"runtime"
+	"strconv"
+	"strings"
+	"time"
 
-	"github.com/cilium/cilium/pkg/bpf"
-	"github.com/cilium/cilium/pkg/bpfdebug"
+	"github.com/cilium/cilium/daemon/defaults"
+	"github.com/cilium/cilium/monitor/payload"
+	"github.com/cilium/cilium/pkg/byteorder"
+	"github.com/cilium/cilium/pkg/monitor"
 
 	"github.com/spf13/cobra"
-	"golang.org/x/sys/unix"
+	"github.com/spf13/pflag"
+)
+
+const (
+	msgSeparator = "------------------------------------------------------------------------------"
+	connTimeout  = 12 * time.Second
 )
 
 // monitorCmd represents the monitor command
 var monitorCmd = &cobra.Command{
 	Use:   "monitor",
-	Short: "Monitoring",
-	Long: `The monitor displays notifications and events omitted by the BPF
+	Short: "Display BPF program events",
+	Long: `The monitor displays notifications and events emitted by the BPF
 programs attached to endpoints and devices. This includes:
   * Dropped packet notifications
   * Captured packet traces
@@ -43,100 +55,275 @@ programs attached to endpoints and devices. This includes:
 	},
 }
 
+type uint16Flags []uint16
+
+var _ pflag.Value = &uint16Flags{}
+
+func (i *uint16Flags) String() string {
+	pieces := make([]string, 0, len(*i))
+	for _, v := range *i {
+		pieces = append(pieces, strconv.Itoa(int(v)))
+	}
+	return strings.Join(pieces, ", ")
+}
+
+func (i *uint16Flags) Set(value string) error {
+	v, err := strconv.Atoi(value)
+	if err != nil {
+		return err
+	}
+	*i = append(*i, uint16(v))
+	return nil
+}
+
+func (i *uint16Flags) Type() string {
+	return "[]uint16"
+}
+
+func (i *uint16Flags) has(value uint16) bool {
+	for _, v := range *i {
+		if v == value {
+			return true
+		}
+	}
+
+	return false
+}
+
+// Verbosity levels for formatting output.
+type Verbosity uint8
+
+const (
+	// INFO is the level of verbosity in which summaries of Drop and Capture
+	// messages are printed out when the monitor is invoked
+	INFO Verbosity = iota + 1
+	// DEBUG is the level of verbosity in which more information about packets
+	// is printed than in INFO mode. Debug, Drop, and Capture messages are printed.
+	DEBUG
+	// VERBOSE is the level of verbosity in which the most information possible
+	// about packets is printed out. Currently is not utilized.
+	VERBOSE
+)
+
 func init() {
-	RootCmd.AddCommand(monitorCmd)
-	monitorCmd.Flags().IntVarP(&eventConfig.NumCpus, "num-cpus", "c", runtime.NumCPU(), "Number of CPUs")
-	monitorCmd.Flags().IntVarP(&eventConfig.NumPages, "num-pages", "n", 64, "Number of pages for ring buffer")
-	monitorCmd.Flags().BoolVarP(&dissect, "dissect", "d", false, "Dissect packet data")
+	rootCmd.AddCommand(monitorCmd)
+	monitorCmd.Flags().BoolVar(&hex, "hex", false, "Do not dissect, print payload in HEX")
+	monitorCmd.Flags().VarP(&eventTypes, "type", "t", fmt.Sprintf("Filter by event types %v", monitor.GetAllTypes()))
+	monitorCmd.Flags().Var(&fromSource, "from", "Filter by source endpoint id")
+	monitorCmd.Flags().Var(&toDst, "to", "Filter by destination endpoint id")
+	monitorCmd.Flags().Var(&related, "related-to", "Filter by either source or destination endpoint id")
+	monitorCmd.Flags().BoolVarP(&verboseMonitor, "verbose", "v", false, "Enable verbose output")
 }
 
 var (
-	dissect     = false
-	eventConfig = bpf.PerfEventConfig{
-		MapName:      bpf.EventsMapName,
-		Type:         bpf.PERF_TYPE_SOFTWARE,
-		Config:       bpf.PERF_COUNT_SW_BPF_OUTPUT,
-		SampleType:   bpf.PERF_SAMPLE_RAW,
-		WakeupEvents: 1,
-	}
+	hex            = false
+	eventTypes     = monitor.MessageTypeFilter{}
+	fromSource     = uint16Flags{}
+	toDst          = uint16Flags{}
+	related        = uint16Flags{}
+	verboseMonitor = false
+	verbosity      = INFO
 )
 
-func lostEvent(lost *bpf.PerfEventLost, cpu int) {
-	fmt.Printf("Lost %d events\n", lost.Lost)
+func setVerbosity() {
+	if verboseMonitor {
+		verbosity = DEBUG
+	} else {
+		verbosity = INFO
+	}
 }
 
-func receiveEvent(msg *bpf.PerfEventSample, cpu int) {
-	prefix := fmt.Sprintf("CPU %02d:", cpu)
+func lostEvent(lost uint64, cpu int) {
+	fmt.Printf("CPU %02d: Lost %d events\n", cpu, lost)
+}
 
-	data := msg.DataDirect()
-	if data[0] == bpfdebug.MessageTypeDrop {
-		dn := bpfdebug.DropNotify{}
-		if err := binary.Read(bytes.NewReader(data), binary.LittleEndian, &dn); err != nil {
-			fmt.Printf("Error while parsing drop notification message: %s\n", err)
+// match checks if the event type, from endpoint and / or to endpoint match
+// when they are supplied. The either part of from and to endpoint depends on
+// related to, which can match on both.  If either one of them is less than or
+// equal to zero, then it is assumed user did not use them.
+func match(messageType int, src uint16, dst uint16) bool {
+	if len(eventTypes) > 0 && !eventTypes.Contains(messageType) {
+		return false
+	} else if len(fromSource) > 0 && !fromSource.has(src) {
+		return false
+	} else if len(toDst) > 0 && !toDst.has(dst) {
+		return false
+	} else if len(related) > 0 && !related.has(src) && !related.has(dst) {
+		return false
+	}
+
+	return true
+}
+
+// dropEvents prints out all the received drop notifications.
+func dropEvents(prefix string, data []byte) {
+	dn := monitor.DropNotify{}
+
+	if err := binary.Read(bytes.NewReader(data), byteorder.Native, &dn); err != nil {
+		fmt.Printf("Error while parsing drop notification message: %s\n", err)
+	}
+	if match(monitor.MessageTypeDrop, dn.Source, uint16(dn.DstID)) {
+		if verbosity == INFO {
+			dn.DumpInfo(data)
+		} else {
+			fmt.Println(msgSeparator)
+			dn.DumpVerbose(!hex, data, prefix)
 		}
-		dn.Dump(dissect, data, prefix)
-	} else if data[0] == bpfdebug.MessageTypeDebug {
-		dm := bpfdebug.DebugMsg{}
-		if err := binary.Read(bytes.NewReader(data), binary.LittleEndian, &dm); err != nil {
-			fmt.Printf("Error while parsing debug message: %s\n", err)
+	}
+}
+
+// traceEvents prints out all the received trace notifications.
+func traceEvents(prefix string, data []byte) {
+	tn := monitor.TraceNotify{}
+
+	if err := binary.Read(bytes.NewReader(data), byteorder.Native, &tn); err != nil {
+		fmt.Printf("Error while parsing trace notification message: %s\n", err)
+	}
+	if match(monitor.MessageTypeTrace, tn.Source, tn.DstID) {
+		if verbosity == INFO {
+			tn.DumpInfo(data)
+		} else {
+			fmt.Println(msgSeparator)
+			tn.DumpVerbose(!hex, data, prefix)
+		}
+	}
+}
+
+// debugEvents prints out all the debug messages.
+func debugEvents(prefix string, data []byte) {
+	dm := monitor.DebugMsg{}
+
+	if err := binary.Read(bytes.NewReader(data), byteorder.Native, &dm); err != nil {
+		fmt.Printf("Error while parsing debug message: %s\n", err)
+	}
+	if match(monitor.MessageTypeDebug, dm.Source, 0) {
+		if verbosity == INFO {
+			dm.DumpInfo(data)
 		} else {
 			dm.Dump(data, prefix)
 		}
-	} else if data[0] == bpfdebug.MessageTypeCapture {
-		dc := bpfdebug.DebugCapture{}
-		if err := binary.Read(bytes.NewReader(data), binary.LittleEndian, &dc); err != nil {
-			fmt.Printf("Error while parsing debug capture message: %s\n", err)
-		}
-		dc.Dump(dissect, data, prefix)
-	} else {
-		fmt.Printf("%s Unknonwn event: %+v\n", prefix, msg)
 	}
 }
 
-func runMonitor() {
-	if os.Getuid() != 0 {
-		fmt.Fprintf(os.Stderr, "Please run the monitor with root privileges.\n")
-		os.Exit(1)
+// captureEvents prints out all the capture messages.
+func captureEvents(prefix string, data []byte) {
+	dc := monitor.DebugCapture{}
+
+	if err := binary.Read(bytes.NewReader(data), byteorder.Native, &dc); err != nil {
+		fmt.Printf("Error while parsing debug capture message: %s\n", err)
+	}
+	if match(monitor.MessageTypeCapture, dc.Source, 0) {
+		if verbosity == INFO {
+			dc.DumpInfo(data)
+		} else {
+			fmt.Println(msgSeparator)
+			dc.DumpVerbose(!hex, data, prefix)
+		}
+	}
+}
+
+// logRecordEvents prints out LogRecord events
+func logRecordEvents(prefix string, data []byte) {
+	buf := bytes.NewBuffer(data[1:])
+	dec := gob.NewDecoder(buf)
+
+	lr := monitor.LogRecordNotify{}
+	if err := dec.Decode(&lr); err != nil {
+		fmt.Printf("Error while decoding LogRecord notification message: %s\n", err)
 	}
 
-	events, err := bpf.NewPerCpuEvents(&eventConfig)
-	if err != nil {
-		panic(err)
+	if match(monitor.MessageTypeAccessLog, uint16(lr.SourceEndpoint.ID), uint16(lr.DestinationEndpoint.ID)) {
+		lr.DumpInfo()
+	}
+}
+
+// agentEvents prints out agent events
+func agentEvents(prefix string, data []byte) {
+	buf := bytes.NewBuffer(data[1:])
+	dec := gob.NewDecoder(buf)
+
+	an := monitor.AgentNotify{}
+	if err := dec.Decode(&an); err != nil {
+		fmt.Printf("Error while decoding agent notification message: %s\n", err)
 	}
 
+	if match(monitor.MessageTypeAgent, 0, 0) {
+		an.DumpInfo()
+	}
+}
+
+// receiveEvent forwards all the per CPU events to the appropriate type function.
+func receiveEvent(data []byte, cpu int) {
+	prefix := fmt.Sprintf("CPU %02d:", cpu)
+	messageType := data[0]
+
+	switch messageType {
+	case monitor.MessageTypeDrop:
+		dropEvents(prefix, data)
+	case monitor.MessageTypeDebug:
+		debugEvents(prefix, data)
+	case monitor.MessageTypeCapture:
+		captureEvents(prefix, data)
+	case monitor.MessageTypeTrace:
+		traceEvents(prefix, data)
+	case monitor.MessageTypeAccessLog:
+		logRecordEvents(prefix, data)
+	case monitor.MessageTypeAgent:
+		agentEvents(prefix, data)
+	default:
+		fmt.Printf("%s Unknown event: %+v\n", prefix, data)
+	}
+}
+
+func setupSigHandler() {
 	signalChan := make(chan os.Signal, 1)
 	signal.Notify(signalChan, os.Interrupt)
 	go func() {
 		for range signalChan {
-			fmt.Printf("\nReceived an interrupt, stopping monitor...\n\n")
-
-			lost, unknown := events.Stats()
-			if lost != 0 || unknown != 0 {
-				fmt.Printf("%d events lost, %d unknown notifications\n", lost, unknown)
-			}
-
-			if err := events.CloseAll(); err != nil {
-				panic(err)
-			}
-
+			fmt.Printf("\nReceived an interrupt, disconnecting from monitor...\n\n")
 			os.Exit(0)
 		}
 	}()
+}
 
-	fmt.Printf("Listening for events on %d CPUs with %dx%d of shared memory\n",
-		events.Cpus, events.Npages, events.Pagesize)
-	fmt.Printf("Press Ctrl-C to quit\n")
-
-	for {
-		todo, err := events.Poll(5000)
-		if err != nil && err != unix.EINTR {
-			panic(err)
-		}
-		if todo > 0 {
-			if err := events.ReadAll(receiveEvent, lostEvent); err != nil {
-				fmt.Printf("Error received while reading from perf buffer: %s\n", err)
-			}
+func runMonitor() {
+	setVerbosity()
+	setupSigHandler()
+	if resp, err := client.Daemon.GetHealthz(nil); err == nil {
+		if nm := resp.Payload.NodeMonitor; nm != nil {
+			fmt.Printf("Listening for events on %d CPUs with %dx%d of shared memory\n",
+				nm.Cpus, nm.Npages, nm.Pagesize)
 		}
 	}
+	fmt.Printf("Press Ctrl-C to quit\n")
+start:
+	conn, err := net.Dial("unix", defaults.MonitorSockPath)
+	if err != nil {
+		fmt.Printf("Error: unable to connect to monitor %s\n", err)
+		os.Exit(1)
+	}
 
+	defer conn.Close()
+
+	var meta payload.Meta
+	var pl payload.Payload
+	for {
+		if err := payload.ReadMetaPayload(conn, &meta, &pl); err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				// EOF may be due to invalid payload size. Close the connection just in case.
+				conn.Close()
+				log.WithError(err).Warn("connection closed")
+				time.Sleep(connTimeout)
+				goto start
+			} else {
+				log.WithError(err).Fatal("decoding error")
+			}
+		}
+
+		if pl.Type == payload.EventSample {
+			receiveEvent(pl.Data, pl.CPU)
+		} else /* if pl.Type == payload.RecordLost */ {
+			lostEvent(pl.Lost, pl.CPU)
+		}
+	}
 }

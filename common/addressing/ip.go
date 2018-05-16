@@ -15,12 +15,12 @@
 package addressing
 
 import (
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"net"
+	"reflect"
 
-	"github.com/cilium/cilium/common/ipam"
+	"github.com/cilium/cilium/pkg/byteorder"
 )
 
 type CiliumIP interface {
@@ -32,6 +32,7 @@ type CiliumIP interface {
 	IP() net.IP
 	String() string
 	IsIPv6() bool
+	GetFamilyString() string
 }
 
 type CiliumIPv6 []byte
@@ -71,20 +72,20 @@ func (ip CiliumIPv6) IsIPv6() bool {
 
 // NodeID returns the node ID portion of the address or 0.
 func (ip CiliumIPv6) NodeID() uint32 {
-	return binary.BigEndian.Uint32(ip[8:12])
+	return byteorder.HostToNetworkSlice(ip[8:12], reflect.Uint32).(uint32)
 }
 
 func (ip CiliumIPv6) State() uint16 {
-	return binary.BigEndian.Uint16(ip[12:14])
+	return byteorder.HostToNetworkSlice(ip[12:14], reflect.Uint16).(uint16)
 }
 
 func (ip CiliumIPv6) SetState(state uint16) {
-	binary.BigEndian.PutUint16(ip[12:14], state)
+	byteorder.HostToNetworkPut(ip[12:14], state)
 }
 
 // EndpointID returns the container ID portion of the address or 0.
 func (ip CiliumIPv6) EndpointID() uint16 {
-	return binary.BigEndian.Uint16(ip[14:])
+	return byteorder.HostToNetworkSlice(ip[14:], reflect.Uint16).(uint16)
 }
 
 // ValidContainerIP returns true if IP is a valid IP for a container.
@@ -135,11 +136,6 @@ func (ip CiliumIPv6) EndpointPrefix() *net.IPNet {
 
 func (ip CiliumIPv6) IP() net.IP {
 	return net.IP(ip)
-}
-
-func (ip CiliumIPv6) IPAMReq() ipam.IPAMReq {
-	i := ip.IP()
-	return ipam.IPAMReq{IP: &i}
 }
 
 func (ip CiliumIPv6) String() string {
@@ -204,11 +200,11 @@ func (ip CiliumIPv4) IsIPv6() bool {
 func (ip CiliumIPv4) NodeID() uint32 {
 	data := make([]byte, 4)
 	copy(data, ip[0:2])
-	return binary.BigEndian.Uint32(data)
+	return byteorder.HostToNetworkSlice(data, reflect.Uint32).(uint32)
 }
 
 func (ip CiliumIPv4) EndpointID() uint16 {
-	return binary.BigEndian.Uint16(ip[2:])
+	return byteorder.HostToNetworkSlice(ip[2:], reflect.Uint16).(uint16)
 }
 
 func (ip CiliumIPv4) IPNet(ones int) *net.IPNet {
@@ -229,11 +225,6 @@ func (ip CiliumIPv4) IP() net.IP {
 func (ip CiliumIPv4) State() uint16 {
 	// IPv4 addresses can't carry state
 	return 0
-}
-
-func (ip CiliumIPv4) IPAMReq() ipam.IPAMReq {
-	i := ip.IP()
-	return ipam.IPAMReq{IP: &i}
 }
 
 func (ip CiliumIPv4) String() string {
@@ -288,4 +279,14 @@ func (ip CiliumIPv4) NodeIP() net.IP {
 	nodeIP[3] = 1
 
 	return nodeIP
+}
+
+// GetFamilyString returns the address family of ip as a string.
+func (ip CiliumIPv4) GetFamilyString() string {
+	return "IPv4"
+}
+
+// GetFamilyString returns the address family of ip as a string.
+func (ip CiliumIPv6) GetFamilyString() string {
+	return "IPv6"
 }

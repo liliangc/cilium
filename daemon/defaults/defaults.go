@@ -14,6 +14,8 @@
 
 package defaults
 
+import "github.com/sirupsen/logrus"
+
 const (
 	// RuntimePath is the default path to the runtime directory
 	RuntimePath = "/var/run/cilium"
@@ -38,4 +40,18 @@ const (
 
 	// SockPathEnv is the environment variable to overwrite SockPath
 	SockPathEnv = "CILIUM_SOCK"
+
+	// MonitorSockPath is the path to the UNIX domain socket used to distribute events
+	// between multiple monitors.
+	MonitorSockPath = RuntimePath + "/monitor.sock"
+
+	// PidFilePath is the path to the pid file for the agent.
+	PidFilePath = RuntimePath + "/cilium.pid"
+
+	// DefaultLogLevel is the alternative we provide to Debug
+	// We set this in pkg/logging.
+	DefaultLogLevel = logrus.InfoLevel
+
+	// EventsPipe is the name of the named pipe for agent <=> monitor events
+	EventsPipe = "events.sock"
 )

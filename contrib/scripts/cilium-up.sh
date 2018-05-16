@@ -23,9 +23,9 @@ sleep 3s
 docker run -d \
    --name "cilium-consul" \
    -p 8501:8500 \
-   -e 'CONSUL_LOCAL_CONFIG={"skip_leave_on_interrupt": true}' \
-   consul:v0.6.4 \
+   -e 'CONSUL_LOCAL_CONFIG={"skip_leave_on_interrupt": true, "disable_update_check": true}' \
+   consul:0.8.3 \
    agent -client=0.0.0.0 -server -bootstrap-expect 1
 
 $dir/plugins/cilium-docker/cilium-docker&
-$dir/daemon/cilium-agent --kvstore consul --consul 127.0.0.1:8501 $*
+$dir/daemon/cilium-agent --kvstore consul --kvstore-opt consul.address=127.0.0.1:8501 $*

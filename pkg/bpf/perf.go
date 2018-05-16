@@ -23,6 +23,7 @@ package bpf
 #include <linux/bpf.h>
 #include <linux/perf_event.h>
 #include <sys/resource.h>
+#include <stdlib.h>
 
 void create_perf_event_attr(int type, int config, int sample_type,
 			    int wakeup_events, void *attr)
@@ -199,6 +200,10 @@ type PerfEvent struct {
 	lost     uint64
 	unknown  uint64
 	data     []byte
+	// state is placed here to reduce memory allocations
+	state unsafe.Pointer
+	// buf is placed here to reduce memory allocations
+	buf [256]byte
 }
 
 // PerfEventHeader must match 'struct perf_event_header in <linux/perf_event.h>.
@@ -224,8 +229,7 @@ type PerfEventLost struct {
 
 func (e *PerfEventSample) DataDirect() []byte {
 	// http://stackoverflow.com/questions/27532523/how-to-convert-1024c-char-to-1024byte
-	size := e.Size - 4
-	return (*[1 << 30]byte)(unsafe.Pointer(&e.data))[:int(size):int(size)]
+	return (*[1 << 30]byte)(unsafe.Pointer(&e.data))[:int(e.Size):int(e.Size)]
 }
 
 func (e *PerfEventSample) DataCopy() []byte {
@@ -247,7 +251,7 @@ func PerfEventOpen(config *PerfEventConfig, pid int, cpu int, groupFD int, flags
 	)
 
 	ret, _, err := unix.Syscall6(
-		C.__NR_perf_event_open,
+		unix.SYS_PERF_EVENT_OPEN,
 		uintptr(unsafe.Pointer(&attr)),
 		uintptr(pid),
 		uintptr(cpu),
@@ -283,16 +287,10 @@ func (e *PerfEvent) Mmap(pagesize int, npages int) error {
 }
 
 func (e *PerfEvent) Enable() error {
-	_, _, err := unix.Syscall(
-		unix.SYS_IOCTL,
-		uintptr(e.Fd),
-		C.PERF_EVENT_IOC_ENABLE,
-		0)
-
-	if err != 0 {
-		return fmt.Errorf("Unable to enable perf event: %s", err)
+	if err := unix.IoctlSetInt(e.Fd, unix.PERF_EVENT_IOC_ENABLE, 0); err != nil {
+		return fmt.Errorf("Unable to enable perf event: %v", err)
 	}
-
+	e.state = C.malloc(C.size_t(unsafe.Sizeof(C.struct_read_state{})))
 	return nil
 }
 
@@ -301,37 +299,28 @@ func (e *PerfEvent) Disable() error {
 		return nil
 	}
 
-	_, _, err := unix.Syscall(
-		unix.SYS_IOCTL,
-		uintptr(e.Fd),
-		C.PERF_EVENT_IOC_DISABLE,
-		0)
-
-	if err != 0 {
-		return fmt.Errorf("Unable to disable perf event: %s", err)
+	C.free(e.state)
+	if err := unix.IoctlSetInt(e.Fd, unix.PERF_EVENT_IOC_DISABLE, 0); err != nil {
+		return fmt.Errorf("Unable to disable perf event: %v", err)
 	}
-
 	return nil
 }
 
-func (e *PerfEvent) Read(receive ReceiveFunc, lostFn LostFunc) error {
-	buf := make([]byte, 256)
-	state := C.struct_read_state{}
-
+func (e *PerfEvent) Read(receive ReceiveFunc, lostFn LostFunc) {
 	// Prepare for reading and check if events are available
 	available := C.perf_event_read_init(C.int(e.npages), C.int(e.pagesize),
-		unsafe.Pointer(&e.data[0]), unsafe.Pointer(&state))
+		unsafe.Pointer(&e.data[0]), unsafe.Pointer(e.state))
 
 	// Poll false positive
 	if available == 0 {
-		return nil
+		return
 	}
 
 	for {
 		var msg *PerfEventHeader
 
-		if ok := C.perf_event_read(unsafe.Pointer(&state),
-			unsafe.Pointer(&buf[0]), unsafe.Pointer(&msg)); ok == 0 {
+		if ok := C.perf_event_read(unsafe.Pointer(e.state),
+			unsafe.Pointer(&e.buf[0]), unsafe.Pointer(&msg)); ok == 0 {
 			break
 		}
 
@@ -352,9 +341,7 @@ func (e *PerfEvent) Read(receive ReceiveFunc, lostFn LostFunc) error {
 	}
 
 	// Move ring buffer tail pointer
-	C.perf_event_read_finish(unsafe.Pointer(&e.data[0]), unsafe.Pointer(&state))
-
-	return nil
+	C.perf_event_read_finish(unsafe.Pointer(&e.data[0]), unsafe.Pointer(e.state))
 }
 
 func (e *PerfEvent) Close() {
@@ -471,7 +458,7 @@ func NewPerCpuEvents(config *PerfEventConfig) (*PerCpuEvents, error) {
 		}
 		e.event[event.Fd] = event
 
-		if err := e.poll.AddFD(event.Fd, unix.EPOLLIN); err != nil {
+		if err = e.poll.AddFD(event.Fd, unix.EPOLLIN); err != nil {
 			return nil, err
 		}
 
@@ -503,9 +490,7 @@ func (e *PerCpuEvents) ReadAll(receive ReceiveFunc, lost LostFunc) error {
 	for i := 0; i < e.poll.nfds; i++ {
 		fd := int(e.poll.events[i].Fd)
 		if event, ok := e.event[fd]; ok {
-			if err := event.Read(receive, lost); err != nil {
-				return err
-			}
+			event.Read(receive, lost)
 		}
 	}
 

@@ -1,4 +1,4 @@
-// Copyright 2016-2017 Authors of Cilium
+// Copyright 2016-2018 Authors of Cilium
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,122 +15,33 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"fmt"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/cilium/cilium/api/v1/models"
 	. "github.com/cilium/cilium/api/v1/server/restapi/endpoint"
 	"github.com/cilium/cilium/pkg/apierror"
+	"github.com/cilium/cilium/pkg/bpf"
+	"github.com/cilium/cilium/pkg/completion"
+	"github.com/cilium/cilium/pkg/controller"
 	"github.com/cilium/cilium/pkg/endpoint"
+	"github.com/cilium/cilium/pkg/endpointmanager"
+	"github.com/cilium/cilium/pkg/identity"
+	"github.com/cilium/cilium/pkg/ipam"
+	"github.com/cilium/cilium/pkg/ipcache"
 	"github.com/cilium/cilium/pkg/labels"
-	"github.com/cilium/cilium/pkg/policy"
+	"github.com/cilium/cilium/pkg/logging/logfields"
+	ipCacheBPF "github.com/cilium/cilium/pkg/maps/ipcache"
+	"github.com/cilium/cilium/pkg/maps/lxcmap"
+	"github.com/cilium/cilium/pkg/option"
 
 	"github.com/go-openapi/runtime/middleware"
+	"github.com/sirupsen/logrus"
 )
-
-func (d *Daemon) lookupCiliumEndpoint(id uint16) *endpoint.Endpoint {
-	if ep, ok := d.endpoints[id]; ok {
-		return ep
-	}
-	return nil
-}
-
-func (d *Daemon) lookupDockerEndpoint(id string) *endpoint.Endpoint {
-	i := endpoint.NewID(endpoint.DockerEndpointPrefix, id)
-	if ep, ok := d.endpointsAux[i]; ok {
-		return ep
-	}
-	return nil
-}
-
-func (d *Daemon) lookupDockerID(id string) *endpoint.Endpoint {
-	i := endpoint.NewID(endpoint.ContainerIdPrefix, id)
-	if ep, ok := d.endpointsAux[i]; ok {
-		return ep
-	}
-	return nil
-}
-
-func (d *Daemon) linkContainerID(ep *endpoint.Endpoint) {
-	id := endpoint.NewID(endpoint.ContainerIdPrefix, ep.DockerID)
-	d.endpointsAux[id] = ep
-}
-
-// insertEndpoint inserts the ep in the endpoints map. To be used with endpointsMU locked.
-func (d *Daemon) insertEndpoint(ep *endpoint.Endpoint) {
-	ep.Mutex.Lock()
-	defer ep.Mutex.Unlock()
-	d.endpoints[ep.ID] = ep
-
-	if ep.DockerID != "" {
-		d.linkContainerID(ep)
-	}
-
-	if ep.DockerEndpointID != "" {
-		id := endpoint.NewID(endpoint.DockerEndpointPrefix, ep.DockerEndpointID)
-		d.endpointsAux[id] = ep
-	}
-}
-
-func (d *Daemon) removeEndpoint(ep *endpoint.Endpoint) {
-	delete(d.endpoints, ep.ID)
-
-	if ep.DockerID != "" {
-		id := endpoint.NewID(endpoint.ContainerIdPrefix, ep.DockerID)
-		delete(d.endpointsAux, id)
-	}
-
-	if ep.DockerEndpointID != "" {
-		id := endpoint.NewID(endpoint.DockerEndpointPrefix, ep.DockerID)
-		delete(d.endpointsAux, id)
-	}
-}
-
-// Sets the given secLabel on the endpoint with the given endpointID. Returns a pointer of
-// a copy endpoint if the endpoint was found, nil otherwise.
-func (d *Daemon) SetEndpointIdentity(ep *endpoint.Endpoint, dockerID, dockerEPID string, labels *policy.Identity) {
-	setIfNotEmpty := func(receiver *string, provider string) {
-		if receiver != nil && *receiver == "" && provider != "" {
-			*receiver = provider
-		}
-	}
-
-	ep.Mutex.Lock()
-	setIfNotEmpty(&ep.DockerID, dockerID)
-	setIfNotEmpty(&ep.DockerEndpointID, dockerEPID)
-	ep.Mutex.Unlock()
-
-	ep.SetIdentity(d, labels)
-}
-
-func (d *Daemon) lookupEndpoint(id string) (*endpoint.Endpoint, *apierror.APIError) {
-	prefix, eid, err := endpoint.ParseID(id)
-	if err != nil {
-		return nil, apierror.Error(GetEndpointIDInvalidCode, err)
-	}
-
-	switch prefix {
-	case endpoint.CiliumLocalIdPrefix:
-		n, _ := endpoint.ParseCiliumID(id)
-		return d.lookupCiliumEndpoint(uint16(n)), nil
-	case endpoint.CiliumGlobalIdPrefix:
-		return nil, apierror.New(GetEndpointIDInvalidCode,
-			"Unsupported id format for now")
-	case endpoint.ContainerIdPrefix:
-		return d.lookupDockerID(eid), nil
-	case endpoint.DockerEndpointPrefix:
-		return d.lookupDockerEndpoint(eid), nil
-	default:
-		return nil, apierror.New(GetEndpointIDInvalidCode, "Unknown endpoint prefix %s", prefix)
-	}
-}
-
-func (d *Daemon) EndpointExists(id string) bool {
-	d.endpointsMU.RLock()
-	ep, err := d.lookupEndpoint(id)
-	d.endpointsMU.RUnlock()
-	return err == nil && ep != nil
-}
 
 type getEndpoint struct {
 	d *Daemon
@@ -141,24 +52,57 @@ func NewGetEndpointHandler(d *Daemon) GetEndpointHandler {
 }
 
 func (h *getEndpoint) Handle(params GetEndpointParams) middleware.Responder {
-	log.Debugf("GET /endpoint request: %+v", params)
+	log.WithField(logfields.Params, logfields.Repr(params)).Debug("GET /endpoint request")
+	resEPs := getEndpointList(params)
 
-	var wg sync.WaitGroup
-	i := 0
-	h.d.endpointsMU.RLock()
-	eps := make([]*models.Endpoint, len(h.d.endpoints))
-	wg.Add(len(h.d.endpoints))
-	for k := range h.d.endpoints {
-		go func(wg *sync.WaitGroup, i int, ep *endpoint.Endpoint) {
-			eps[i] = ep.GetModel()
-			wg.Done()
-		}(&wg, i, h.d.endpoints[k])
-		i++
+	if params.Labels != nil && len(resEPs) == 0 {
+		return NewGetEndpointNotFound()
 	}
-	h.d.endpointsMU.RUnlock()
-	wg.Wait()
 
-	return NewGetEndpointOK().WithPayload(eps)
+	return NewGetEndpointOK().WithPayload(resEPs)
+}
+
+func getEndpointList(params GetEndpointParams) []*models.Endpoint {
+	var (
+		epModelsWg, epsAppendWg sync.WaitGroup
+		convertedLabels         labels.Labels
+		resEPs                  []*models.Endpoint
+	)
+
+	if params.Labels != nil {
+		// Convert params.Labels to model that we can compare with the endpoint's labels.
+		convertedLabels = labels.NewLabelsFromModel(params.Labels)
+	}
+
+	eps := endpointmanager.GetEndpoints()
+	epModelsCh := make(chan *models.Endpoint, len(eps))
+
+	epModelsWg.Add(len(eps))
+	for _, ep := range eps {
+		go func(wg *sync.WaitGroup, epChan chan<- *models.Endpoint, ep *endpoint.Endpoint) {
+			if ep.HasLabels(convertedLabels) {
+				epChan <- ep.GetModel()
+			}
+			wg.Done()
+		}(&epModelsWg, epModelsCh, ep)
+	}
+
+	epsAppendWg.Add(1)
+	// This needs to be done over channels since we might not receive all
+	// the existing endpoints since not all endpoints contain the list of
+	// labels that we will use to filter in `ep.HasLabels(convertedLabels)`
+	go func(epsAppended *sync.WaitGroup) {
+		for ep := range epModelsCh {
+			resEPs = append(resEPs, ep)
+		}
+		epsAppended.Done()
+	}(&epsAppendWg)
+
+	epModelsWg.Wait()
+	close(epModelsCh)
+	epsAppendWg.Wait()
+
+	return resEPs
 }
 
 type getEndpointID struct {
@@ -170,13 +114,12 @@ func NewGetEndpointIDHandler(d *Daemon) GetEndpointIDHandler {
 }
 
 func (h *getEndpointID) Handle(params GetEndpointIDParams) middleware.Responder {
-	log.Debugf("GET /endpoint/{id} request: %+v", params.ID)
+	log.WithField(logfields.EndpointID, params.ID).Debug("GET /endpoint/{id} request")
 
-	h.d.endpointsMU.RLock()
-	ep, err := h.d.lookupEndpoint(params.ID)
-	h.d.endpointsMU.RUnlock()
+	ep, err := endpointmanager.Lookup(params.ID)
+
 	if err != nil {
-		return err
+		return apierror.Error(GetEndpointIDInvalidCode, err)
 	} else if ep == nil {
 		return NewGetEndpointIDNotFound()
 	} else {
@@ -192,8 +135,50 @@ func NewPutEndpointIDHandler(d *Daemon) PutEndpointIDHandler {
 	return &putEndpointID{d: d}
 }
 
+// createEndpoint attempts to create the endpoint corresponding to the change
+// request that was specified. Returns an HTTP code response code and an
+// error msg (or nil on success).
+func (d *Daemon) createEndpoint(epTemplate *models.EndpointChangeRequest, id string, lbls []string) (int, error) {
+	addLabels := labels.NewLabelsFromModel(lbls)
+	ep, err := endpoint.NewEndpointFromChangeModel(epTemplate, addLabels)
+	if err != nil {
+		return PutEndpointIDInvalidCode, err
+	}
+	ep.SetDefaultOpts(option.Config.Opts)
+
+	oldEp, err2 := endpointmanager.Lookup(id)
+	if err2 != nil {
+		return PutEndpointIDInvalidCode, err2
+	} else if oldEp != nil {
+		return PutEndpointIDExistsCode, fmt.Errorf("Endpoint ID %s exists", id)
+	}
+	if err = endpoint.APICanModify(ep); err != nil {
+		return PutEndpointIDInvalidCode, err
+	}
+
+	if err := endpointmanager.AddEndpoint(d, ep, "Create endpoint from API PUT"); err != nil {
+		log.WithError(err).Warn("Aborting endpoint join")
+		return PutEndpointIDFailedCode, err
+	}
+
+	if len(addLabels) > 0 {
+		code, errLabelsAdd := d.updateEndpointLabels(id, addLabels, labels.Labels{})
+		if errLabelsAdd != nil {
+			// XXX: Why should the endpoint remain in this case?
+			log.WithFields(logrus.Fields{
+				logfields.EndpointID:              id,
+				logfields.IdentityLabels:          logfields.Repr(addLabels),
+				logfields.IdentityLabels + ".bad": errLabelsAdd,
+			}).Error("Could not add labels while creating an ep due to bad labels")
+			return code, errLabelsAdd
+		}
+	}
+
+	return PutEndpointIDCreatedCode, nil
+}
+
 func (h *putEndpointID) Handle(params PutEndpointIDParams) middleware.Responder {
-	log.Debugf("PUT /endpoint/{id} request: %+v", params)
+	log.WithField(logfields.Params, logfields.Repr(params)).Debug("PUT /endpoint/{id} request")
 
 	epTemplate := params.Endpoint
 	if n, err := endpoint.ParseCiliumID(params.ID); err != nil {
@@ -206,35 +191,10 @@ func (h *putEndpointID) Handle(params PutEndpointIDParams) middleware.Responder 
 			"endpoint ID cannot be 0")
 	}
 
-	ep, err := endpoint.NewEndpointFromChangeModel(epTemplate)
+	code, err := h.d.createEndpoint(epTemplate, params.ID, params.Endpoint.Labels)
 	if err != nil {
-		return apierror.Error(PutEndpointIDInvalidCode, err)
+		apierror.Error(code, err)
 	}
-
-	ep.SetDefaultOpts(h.d.conf.Opts)
-
-	h.d.endpointsMU.Lock()
-	defer h.d.endpointsMU.Unlock()
-
-	oldEp, err2 := h.d.lookupEndpoint(params.ID)
-	if err2 != nil {
-		return err2
-	} else if oldEp != nil {
-		return NewPutEndpointIDExists()
-	}
-
-	if err := ep.CreateDirectory(); err != nil {
-		log.Warningf("Aborting endpoint join: %s", err)
-		return apierror.Error(PutEndpointIDFailedCode, err)
-	}
-
-	if err := ep.RegenerateIfReady(h.d); err != nil {
-		ep.RemoveDirectory()
-		return apierror.Error(PatchEndpointIDFailedCode, err)
-	}
-
-	h.d.insertEndpoint(ep)
-
 	return NewPutEndpointIDCreated()
 }
 
@@ -246,28 +206,44 @@ func NewPatchEndpointIDHandler(d *Daemon) PatchEndpointIDHandler {
 	return &patchEndpointID{d: d}
 }
 
+func validPatchTransitionState(state models.EndpointState) bool {
+	switch string(state) {
+	case "", endpoint.StateWaitingForIdentity, endpoint.StateReady:
+		return true
+	}
+	return false
+}
+
 func (h *patchEndpointID) Handle(params PatchEndpointIDParams) middleware.Responder {
-	log.Debugf("PATCH /endpoint/{id} %+v", params)
+	scopedLog := log.WithField(logfields.Params, logfields.Repr(params))
+	scopedLog.Debug("PATCH /endpoint/{id} request")
 
 	epTemplate := params.Endpoint
 
 	// Validate the template. Assignment afterwards is atomic.
-	newEp, err2 := endpoint.NewEndpointFromChangeModel(epTemplate)
+	// Note: newEp's labels are ignored.
+	addLabels := labels.NewLabelsFromModel(params.Endpoint.Labels)
+	newEp, err2 := endpoint.NewEndpointFromChangeModel(epTemplate, addLabels)
 	if err2 != nil {
 		return apierror.Error(PutEndpointIDInvalidCode, err2)
 	}
 
-	h.d.endpointsMU.RLock()
-	ep, err := h.d.lookupEndpoint(params.ID)
-	h.d.endpointsMU.RUnlock()
+	// Log invalid state transitions, but do not error out for backwards
+	// compatibility.
+	if !validPatchTransitionState(epTemplate.State) {
+		scopedLog.Debugf("PATCH /endpoint/{id} to invalid state '%s'", epTemplate.State)
+	}
+
+	ep, err := endpointmanager.Lookup(params.ID)
 	if err != nil {
-		return err
+		return apierror.Error(GetEndpointIDInvalidCode, err)
 	}
 	if ep == nil {
 		return NewPatchEndpointIDNotFound()
 	}
-
-	changed := false
+	if err = endpoint.APICanModify(ep); err != nil {
+		return apierror.Error(PatchEndpointIDInvalidCode, err)
+	}
 
 	// FIXME: Support changing these?
 	//  - container ID
@@ -277,39 +253,58 @@ func (h *patchEndpointID) Handle(params PatchEndpointIDParams) middleware.Respon
 	//  Support arbitrary changes? Support only if unset?
 
 	ep.Mutex.Lock()
-	if epTemplate.InterfaceIndex != 0 {
-		ep.IfIndex = int(epTemplate.InterfaceIndex)
+
+	// The endpoint may have just been deleted since the lookup, so return
+	// that it can't be found.
+	if ep.GetStateLocked() == endpoint.StateDisconnecting ||
+		ep.GetStateLocked() == endpoint.StateDisconnected {
+		ep.Mutex.Unlock()
+		return NewPatchEndpointIDNotFound()
+	}
+
+	changed := false
+
+	if epTemplate.InterfaceIndex != 0 && ep.IfIndex != newEp.IfIndex {
+		ep.IfIndex = newEp.IfIndex
 		changed = true
 	}
 
-	if epTemplate.InterfaceName != "" {
-		ep.IfName = epTemplate.InterfaceName
+	if epTemplate.InterfaceName != "" && ep.IfName != newEp.IfName {
+		ep.IfName = newEp.IfName
 		changed = true
 	}
 
-	if epTemplate.State != "" {
-		// FIXME: Validate
-		ep.State = string(epTemplate.State)
-		changed = true
+	// Only support transition to waiting-for-identity state, also
+	// if the request is for ready state, as we will check the
+	// existence of the security label below. Other transitions
+	// are always internally managed, but we do not error out for
+	// backwards compatibility.
+	if epTemplate.State != "" &&
+		validPatchTransitionState(epTemplate.State) &&
+		ep.GetStateLocked() != endpoint.StateWaitingForIdentity {
+		// Will not change state if the current state does not allow the transition.
+		if ep.SetStateLocked(endpoint.StateWaitingForIdentity, "Update endpoint from API PATCH") {
+			changed = true
+		}
 	}
 
-	if epTemplate.Mac != "" {
+	if epTemplate.Mac != "" && bytes.Compare(ep.LXCMAC, newEp.LXCMAC) != 0 {
 		ep.LXCMAC = newEp.LXCMAC
 		changed = true
 	}
 
-	if epTemplate.HostMac != "" {
+	if epTemplate.HostMac != "" && bytes.Compare(ep.NodeMAC, newEp.NodeMAC) != 0 {
 		ep.NodeMAC = newEp.NodeMAC
 		changed = true
 	}
 
 	if epTemplate.Addressing != nil {
-		if ip := epTemplate.Addressing.IPV6; ip != "" {
+		if ip := epTemplate.Addressing.IPV6; ip != "" && bytes.Compare(ep.IPv6, newEp.IPv6) != 0 {
 			ep.IPv6 = newEp.IPv6
 			changed = true
 		}
 
-		if ip := epTemplate.Addressing.IPV4; ip != "" {
+		if ip := epTemplate.Addressing.IPV4; ip != "" && bytes.Compare(ep.IPv4, newEp.IPv4) != 0 {
 			ep.IPv4 = newEp.IPv4
 			changed = true
 		}
@@ -317,82 +312,141 @@ func (h *patchEndpointID) Handle(params PatchEndpointIDParams) middleware.Respon
 
 	// If desired state is waiting-for-identity but identity is already
 	// known, bump it to ready state immediately to force re-generation
-	if ep.State == endpoint.StateWaitingForIdentity && ep.SecLabel != nil {
-		ep.State = endpoint.StateReady
+	if ep.GetStateLocked() == endpoint.StateWaitingForIdentity && ep.SecurityIdentity != nil {
+		ep.SetStateLocked(endpoint.StateReady, "Preparing to force endpoint regeneration because identity is known while handling API PATCH")
 		changed = true
+	}
+
+	reason := ""
+	if changed {
+		// Force policy regeneration as endpoint's configuration was changed.
+		// Other endpoints need not be regenerated as no labels were changed.
+		// Note that we still need to (eventually) regenerate the endpoint for
+		// the changes to take effect.
+		ep.ForcePolicyCompute()
+
+		// Transition to waiting-to-regenerate if ready.
+		if ep.GetStateLocked() == endpoint.StateReady {
+			ep.SetStateLocked(endpoint.StateWaitingToRegenerate, "Forcing endpoint regeneration because identity is known while handling API PATCH")
+		}
+
+		switch ep.GetStateLocked() {
+		case endpoint.StateWaitingToRegenerate:
+			reason = "Waiting on endpoint regeneration because identity is known while handling API PATCH"
+		case endpoint.StateWaitingForIdentity:
+			reason = "Waiting on endpoint initial program regeneration while handling API PATCH"
+		}
 	}
 	ep.Mutex.Unlock()
 
-	if changed {
-		if err := ep.RegenerateIfReady(h.d); err != nil {
+	if reason != "" {
+		if err := ep.RegenerateWait(h.d, reason); err != nil {
 			return apierror.Error(PatchEndpointIDFailedCode, err)
 		}
-
 		// FIXME: Special return code to indicate regeneration happened?
 	}
 
 	return NewPatchEndpointIDOK()
 }
 
-// deleteEndpoint must be called with d.endpointsMU locked.
 func (d *Daemon) deleteEndpoint(ep *endpoint.Endpoint) int {
-	errors := 0
+	scopedLog := log.WithField(logfields.EndpointID, ep.ID)
+	errors := d.deleteEndpointQuiet(ep)
+	for _, err := range errors {
+		scopedLog.WithError(err).Warn("Ignoring error while deleting endpoint")
+	}
+	return len(errors)
+}
+
+func (d *Daemon) deleteEndpointQuiet(ep *endpoint.Endpoint) []error {
+	errors := []error{}
+
+	// Wait for existing builds to complete and prevent further builds
+	ep.BuildMutex.Lock()
+
+	// Lock out any other writers to the endpoint
 	ep.Mutex.Lock()
-	defer ep.Mutex.Unlock()
-	ep.LeaveLocked(d)
 
-	if err := d.conf.LXCMap.DeleteElement(ep); err != nil {
-		log.Warningf("Unable to remove endpoint from map: %s", err)
-		errors++
+	// In case multiple delete requests have been enqueued, have all of them
+	// except the first return here.
+	if ep.GetStateLocked() == endpoint.StateDisconnecting {
+		ep.Mutex.Unlock()
+		ep.BuildMutex.Unlock()
+		return []error{}
 	}
+	ep.SetStateLocked(endpoint.StateDisconnecting, "Deleting endpoint")
 
-	if ep.Consumable != nil {
-		ep.Consumable.RemoveMap(ep.PolicyMap)
-	}
+	// Remove the endpoint before we clean up. This ensures it is no longer
+	// listed or queued for rebuilds.
+	endpointmanager.Remove(ep)
 
-	// Remove policy BPF map
-	if err := os.RemoveAll(ep.PolicyMapPathLocked()); err != nil {
-		log.Warningf("Unable to remove policy map file (%s): %s", ep.PolicyMapPathLocked(), err)
-		errors++
-	}
+	// If dry mode is enabled, no changes to BPF maps are performed
+	if !d.DryModeEnabled() {
+		if err := lxcmap.DeleteElement(ep); err != nil {
+			errors = append(errors, fmt.Errorf("unable to delete element %d from map %s: %s", ep.ID, ep.PolicyMapPathLocked(), err))
+		}
 
-	// Remove IPv6 connection tracking map
-	if err := os.RemoveAll(ep.Ct6MapPathLocked()); err != nil {
-		log.Warningf("Unable to remove IPv6 CT map file (%s): %s", ep.Ct6MapPathLocked(), err)
-		errors++
-	}
+		// Remove policy BPF map
+		if err := os.RemoveAll(ep.PolicyMapPathLocked()); err != nil {
+			errors = append(errors, fmt.Errorf("unable to remove policy map file %s: %s", ep.PolicyMapPathLocked(), err))
+		}
 
-	// Remove IPv4 connection tracking map
-	if err := os.RemoveAll(ep.Ct4MapPathLocked()); err != nil {
-		log.Warningf("Unable to remove IPv4 CT map file (%s): %s", ep.Ct4MapPathLocked(), err)
-		errors++
-	}
+		// Remove calls BPF map
+		if err := os.RemoveAll(ep.CallsMapPathLocked()); err != nil {
+			errors = append(errors, fmt.Errorf("unable to remove calls map file %s: %s", ep.CallsMapPathLocked(), err))
+		}
 
-	d.removeEndpoint(ep)
+		// Remove IPv6 connection tracking map
+		if err := os.RemoveAll(ep.Ct6MapPathLocked()); err != nil {
+			errors = append(errors, fmt.Errorf("unable to remove IPv6 CT map %s: %s", ep.Ct6MapPathLocked(), err))
+		}
 
-	if !d.conf.IPv4Disabled {
-		if err := d.ReleaseIP(ep.IPv4.IP()); err != nil {
-			log.Warningf("error while releasing IPv4 %s: %s", ep.IPv4.IP(), err)
-			errors++
+		// Remove IPv4 connection tracking map
+		if err := os.RemoveAll(ep.Ct4MapPathLocked()); err != nil {
+			errors = append(errors, fmt.Errorf("unable to remove IPv4 CT map %s: %s", ep.Ct4MapPathLocked(), err))
+		}
+
+		// Remove handle_policy() tail call entry for EP
+		if err := ep.RemoveFromGlobalPolicyMap(); err != nil {
+			errors = append(errors, fmt.Errorf("unable to remove endpoint from global policy map: %s", err))
 		}
 	}
 
-	if err := d.ReleaseIP(ep.IPv6.IP()); err != nil {
-		log.Warningf("error while releasing IPv6 %s: %s", ep.IPv6.IP(), err)
-		errors++
+	if !option.Config.IPv4Disabled {
+		if err := ipam.ReleaseIP(ep.IPv4.IP()); err != nil {
+			errors = append(errors, fmt.Errorf("unable to release ipv4 address: %s", err))
+		}
 	}
+
+	if err := ipam.ReleaseIP(ep.IPv6.IP()); err != nil {
+		errors = append(errors, fmt.Errorf("unable to release ipv6 address: %s", err))
+	}
+
+	completionCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ep.ProxyWaitGroup = completion.NewWaitGroup(completionCtx)
+
+	errors = append(errors, ep.LeaveLocked(d)...)
+	ep.Mutex.Unlock()
+
+	err := ep.WaitForProxyCompletions()
+	if err != nil {
+		errors = append(errors, fmt.Errorf("unable to remove proxy redirects: %s", err))
+	}
+	cancel()
+	ep.ProxyWaitGroup = nil
+
+	ep.BuildMutex.Unlock()
 
 	return errors
 }
 
-func (d *Daemon) DeleteEndpoint(id string) (int, *apierror.APIError) {
-	d.endpointsMU.Lock()
-	defer d.endpointsMU.Unlock()
-
-	if ep, err := d.lookupEndpoint(id); err != nil {
-		return 0, err
+func (d *Daemon) DeleteEndpoint(id string) (int, error) {
+	if ep, err := endpointmanager.Lookup(id); err != nil {
+		return 0, apierror.Error(DeleteEndpointIDInvalidCode, err)
 	} else if ep == nil {
 		return 0, apierror.New(DeleteEndpointIDNotFoundCode, "endpoint not found")
+	} else if err = endpoint.APICanModify(ep); err != nil {
+		return 0, apierror.Error(DeleteEndpointIDInvalidCode, err)
 	} else {
 		return d.deleteEndpoint(ep), nil
 	}
@@ -407,11 +461,14 @@ func NewDeleteEndpointIDHandler(d *Daemon) DeleteEndpointIDHandler {
 }
 
 func (h *deleteEndpointID) Handle(params DeleteEndpointIDParams) middleware.Responder {
-	log.Debugf("DELETE /endpoint/{id} %+v", params)
+	log.WithField(logfields.Params, logfields.Repr(params)).Debug("DELETE /endpoint/{id} request")
 
 	d := h.daemon
 	if nerr, err := d.DeleteEndpoint(params.ID); err != nil {
-		return err
+		if apierr, ok := err.(*apierror.APIError); ok {
+			return apierr
+		}
+		return apierror.Error(DeleteEndpointIDErrorsCode, err)
 	} else if nerr > 0 {
 		return NewDeleteEndpointIDErrors().WithPayload(int64(nerr))
 	} else {
@@ -419,17 +476,18 @@ func (h *deleteEndpointID) Handle(params DeleteEndpointIDParams) middleware.Resp
 	}
 }
 
-// EndpointUpdate updates the given endpoint and regenerates the endpoint
-func (d *Daemon) EndpointUpdate(id string, opts models.ConfigurationMap) *apierror.APIError {
-	d.endpointsMU.RLock()
-	ep, err := d.lookupEndpoint(id)
-	d.endpointsMU.RUnlock()
+// EndpointUpdate updates the options of the given endpoint and regenerates the endpoint
+func (d *Daemon) EndpointUpdate(id string, cfg *models.EndpointConfigurationSpec) error {
+	ep, err := endpointmanager.Lookup(id)
 	if err != nil {
-		return err
+		return apierror.Error(PatchEndpointIDInvalidCode, err)
 	}
+	if err = endpoint.APICanModify(ep); err != nil {
+		return apierror.Error(PatchEndpointIDInvalidCode, err)
+	}
+
 	if ep != nil {
-		d.invalidateCache()
-		if err := ep.Update(d, opts); err != nil {
+		if err := ep.Update(d, cfg); err != nil {
 			switch err.(type) {
 			case endpoint.UpdateValidationError:
 				return apierror.Error(PatchEndpointIDConfigInvalidCode, err)
@@ -437,6 +495,9 @@ func (d *Daemon) EndpointUpdate(id string, opts models.ConfigurationMap) *apierr
 				return apierror.Error(PatchEndpointIDConfigFailedCode, err)
 			}
 		}
+		ep.Mutex.RLock()
+		endpointmanager.UpdateReferences(ep)
+		ep.Mutex.RUnlock()
 	} else {
 		return apierror.New(PatchEndpointIDConfigNotFoundCode, "endpoint %s not found", id)
 	}
@@ -453,11 +514,14 @@ func NewPatchEndpointIDConfigHandler(d *Daemon) PatchEndpointIDConfigHandler {
 }
 
 func (h *patchEndpointIDConfig) Handle(params PatchEndpointIDConfigParams) middleware.Responder {
-	log.Debugf("PATCH /endpoint/{id}/config %+v", params)
+	log.WithField(logfields.Params, logfields.Repr(params)).Debug("PATCH /endpoint/{id}/config request")
 
 	d := h.daemon
-	if err := d.EndpointUpdate(params.ID, params.Configuration); err != nil {
-		return err
+	if err := d.EndpointUpdate(params.ID, params.EndpointConfiguration); err != nil {
+		if apierr, ok := err.(*apierror.APIError); ok {
+			return apierr
+		}
+		return apierror.Error(PatchEndpointIDFailedCode, err)
 	}
 
 	return NewPatchEndpointIDConfigOK()
@@ -472,18 +536,25 @@ func NewGetEndpointIDConfigHandler(d *Daemon) GetEndpointIDConfigHandler {
 }
 
 func (h *getEndpointIDConfig) Handle(params GetEndpointIDConfigParams) middleware.Responder {
-	log.Debugf("GET /endpoint/{id}/config %+v", params)
+	log.WithField(logfields.Params, logfields.Repr(params)).Debug("GET /endpoint/{id}/config")
 
-	d := h.daemon
-	d.endpointsMU.RLock()
-	ep, err := d.lookupEndpoint(params.ID)
-	d.endpointsMU.RUnlock()
+	ep, err := endpointmanager.Lookup(params.ID)
 	if err != nil {
-		return err
+		return apierror.Error(GetEndpointIDInvalidCode, err)
 	} else if ep == nil {
 		return NewGetEndpointIDConfigNotFound()
 	} else {
-		return NewGetEndpointIDConfigOK().WithPayload(ep.Opts.GetModel())
+		cfgStatus := &models.EndpointConfigurationStatus{
+			Realized: &models.EndpointConfigurationSpec{
+				LabelConfiguration: &models.LabelConfigurationSpec{
+					User: ep.OpLabels.Custom.GetModel(),
+				},
+				Options: *ep.Opts.GetMutableModel(),
+			},
+			Immutable: *ep.Opts.GetImmutableModel(),
+		}
+
+		return NewGetEndpointIDConfigOK().WithPayload(cfgStatus)
 	}
 }
 
@@ -496,181 +567,294 @@ func NewGetEndpointIDLabelsHandler(d *Daemon) GetEndpointIDLabelsHandler {
 }
 
 func (h *getEndpointIDLabels) Handle(params GetEndpointIDLabelsParams) middleware.Responder {
-	log.Debugf("GET /endpoint/{id}/labels %+v", params)
+	log.WithField(logfields.Params, logfields.Repr(params)).Debug("GET /endpoint/{id}/labels")
 
-	d := h.daemon
-	d.endpointsMU.RLock()
-	ep, err := d.lookupEndpoint(params.ID)
-	d.endpointsMU.RUnlock()
+	ep, err := endpointmanager.Lookup(params.ID)
 	if err != nil {
-		return err
+		return apierror.Error(GetEndpointIDInvalidCode, err)
 	}
 	if ep == nil {
 		return NewGetEndpointIDLabelsNotFound()
 	}
 
 	ep.Mutex.RLock()
-	dockerID := ep.DockerID
-	ep.Mutex.RUnlock()
-
-	d.containersMU.RLock()
-	cont := d.containers[dockerID]
-	d.containersMU.RUnlock()
-	if cont == nil {
-		return NewGetEndpointIDLabelsNotFound()
+	spec := &models.LabelConfigurationSpec{
+		User: ep.OpLabels.Custom.GetModel(),
 	}
 
-	cont.Mutex.RLock()
 	cfg := models.LabelConfiguration{
-		Disabled:            cont.OpLabels.Disabled.GetModel(),
-		Custom:              cont.OpLabels.Custom.GetModel(),
-		OrchestrationSystem: cont.OpLabels.Orchestration.GetModel(),
+		Spec: spec,
+		Status: &models.LabelConfigurationStatus{
+			Realized:         spec,
+			SecurityRelevant: ep.OpLabels.OrchestrationIdentity.GetModel(),
+			Derived:          ep.OpLabels.OrchestrationInfo.GetModel(),
+			Disabled:         ep.OpLabels.Disabled.GetModel(),
+		},
 	}
-	cont.Mutex.RUnlock()
+	ep.Mutex.RUnlock()
 
 	return NewGetEndpointIDLabelsOK().WithPayload(&cfg)
 }
 
-// UpdateSecLabels add and deletes the given labels on given endpoint ID.
+type getEndpointIDLog struct {
+	d *Daemon
+}
+
+func NewGetEndpointIDLogHandler(d *Daemon) GetEndpointIDLogHandler {
+	return &getEndpointIDLog{d: d}
+}
+
+func (h *getEndpointIDLog) Handle(params GetEndpointIDLogParams) middleware.Responder {
+	log.WithField(logfields.EndpointID, params.ID).Debug("GET /endpoint/{id}/log request")
+
+	ep, err := endpointmanager.Lookup(params.ID)
+
+	if err != nil {
+		return apierror.Error(GetEndpointIDLogInvalidCode, err)
+	} else if ep == nil {
+		return NewGetEndpointIDLogNotFound()
+	} else {
+		return NewGetEndpointIDLogOK().WithPayload(ep.Status.GetModel())
+	}
+}
+
+type getEndpointIDHealthz struct {
+	d *Daemon
+}
+
+func NewGetEndpointIDHealthzHandler(d *Daemon) GetEndpointIDHealthzHandler {
+	return &getEndpointIDHealthz{d: d}
+}
+
+func (h *getEndpointIDHealthz) Handle(params GetEndpointIDHealthzParams) middleware.Responder {
+	log.WithField(logfields.EndpointID, params.ID).Debug("GET /endpoint/{id}/log request")
+
+	ep, err := endpointmanager.Lookup(params.ID)
+
+	if err != nil {
+		return apierror.Error(GetEndpointIDHealthzInvalidCode, err)
+	} else if ep == nil {
+		return NewGetEndpointIDHealthzNotFound()
+	} else {
+		return NewGetEndpointIDHealthzOK().WithPayload(ep.GetHealthModel())
+	}
+}
+
+func checkLabels(add, del labels.Labels) (addLabels, delLabels labels.Labels, ok bool) {
+	addLabels, _ = labels.FilterLabels(add)
+	delLabels, _ = labels.FilterLabels(del)
+
+	if len(addLabels) == 0 && len(delLabels) == 0 {
+		return nil, nil, false
+	}
+	return addLabels, delLabels, true
+}
+
+// updateEndpointLabels add and deletes the given labels on given endpoint ID.
 // The received `add` and `del` labels will be filtered with the valid label
 // prefixes.
 // The `add` labels take precedence over `del` labels, this means if the same
 // label is set on both `add` and `del`, that specific label will exist in the
 // endpoint's labels.
-func (d *Daemon) UpdateSecLabels(id string, add, del labels.Labels) middleware.Responder {
-	d.conf.ValidLabelPrefixesMU.RLock()
-	addLabels := d.conf.ValidLabelPrefixes.FilterLabels(add)
-	delLabels := d.conf.ValidLabelPrefixes.FilterLabels(del)
-	d.conf.ValidLabelPrefixesMU.RUnlock()
-
-	if len(addLabels) == 0 && len(delLabels) == 0 {
-		return nil
+// Returns an HTTP response code and an error msg (or nil on success).
+func (d *Daemon) updateEndpointLabels(id string, add, del labels.Labels) (int, error) {
+	addLabels, delLabels, ok := checkLabels(add, del)
+	if !ok {
+		return 0, nil
 	}
 
-	d.endpointsMU.RLock()
-	ep, err := d.lookupEndpoint(id)
-	d.endpointsMU.RUnlock()
+	ep, err := endpointmanager.Lookup(id)
 	if err != nil {
-		return err
+		return GetEndpointIDInvalidCode, err
 	}
 	if ep == nil {
-		return NewPutEndpointIDLabelsNotFound()
+		return PatchEndpointIDLabelsNotFoundCode, fmt.Errorf("Endpoint ID %s not found", id)
 	}
 
-	ep.Mutex.RLock()
-	epDockerID := ep.DockerID
-	ep.Mutex.RUnlock()
-
-	d.containersMU.RLock()
-	cont := d.containers[epDockerID]
-	d.containersMU.RUnlock()
-	if cont == nil {
-		return NewPutEndpointIDLabelsNotFound()
+	if err := ep.ModifyIdentityLabels(d, addLabels, delLabels); err != nil {
+		return PatchEndpointIDLabelsNotFoundCode, err
 	}
 
-	cont.Mutex.RLock()
-	oldLabels := cont.OpLabels.DeepCopy()
-	cont.Mutex.RUnlock()
+	return PatchEndpointIDLabelsOKCode, nil
+}
 
-	if len(delLabels) > 0 {
-		for k := range delLabels {
-			// The change request is accepted if the label is on
-			// any of the lists. If the label is already disabled,
-			// we will simply ignore that change.
-			if oldLabels.Orchestration[k] != nil ||
-				oldLabels.Custom[k] != nil ||
-				oldLabels.Disabled[k] != nil {
-				break
-			}
-
-			return apierror.New(PutEndpointIDLabelsLabelNotFoundCode,
-				"label %s not found", k)
-		}
+// updateEndpointLabelsFromAPI is the same as updateEndpointLabels(), but also
+// performs checks for whether the endpoint may be modified by an API call.
+func (d *Daemon) updateEndpointLabelsFromAPI(id string, add, del labels.Labels) (int, error) {
+	addLabels, delLabels, ok := checkLabels(add, del)
+	if !ok {
+		return 0, nil
+	}
+	if lbls := addLabels.FindReserved(); lbls != nil {
+		return PatchEndpointIDLabelsUpdateFailedCode, fmt.Errorf("Not allowed to add reserved labels: %s", lbls)
+	} else if lbls := delLabels.FindReserved(); lbls != nil {
+		return PatchEndpointIDLabelsUpdateFailedCode, fmt.Errorf("Not allowed to delete reserved labels: %s", lbls)
 	}
 
-	if len(delLabels) > 0 {
-		for k, v := range delLabels {
-			if oldLabels.Orchestration[k] != nil {
-				delete(oldLabels.Orchestration, k)
-				oldLabels.Disabled[k] = v
-			}
-
-			if oldLabels.Custom[k] != nil {
-				delete(oldLabels.Custom, k)
-			}
-		}
+	ep, err := endpointmanager.Lookup(id)
+	if err != nil {
+		return GetEndpointIDInvalidCode, err
 	}
-
-	if len(addLabels) > 0 {
-		for k, v := range addLabels {
-			if oldLabels.Disabled[k] != nil {
-				delete(oldLabels.Disabled, k)
-				oldLabels.Orchestration[k] = v
-			} else if oldLabels.Orchestration[k] == nil {
-				oldLabels.Custom[k] = v
-			}
-		}
-	}
-
-	identity, newHash, err2 := d.updateContainerIdentity(cont.ID, cont.LabelsHash, oldLabels)
-	if err2 != nil {
-		return apierror.Error(PutEndpointIDLabelsUpdateFailedCode, err2)
-	}
-	cont.Mutex.Lock()
-	cont.LabelsHash = newHash
-	cont.OpLabels = *oldLabels
-	contID := cont.ID
-	cont.Mutex.Unlock()
-
-	// FIXME: Undo identity update?
-
-	d.endpointsMU.RLock()
-	ep, _ = d.lookupEndpoint(id)
-	d.endpointsMU.RUnlock()
 	if ep == nil {
-		return NewPutEndpointIDLabelsNotFound()
+		return PatchEndpointIDLabelsNotFoundCode, fmt.Errorf("Endpoint ID %s not found", id)
 	}
-	containerFound := false
-
-	d.containersMU.RLock()
-	if d.containers[epDockerID] != nil {
-		containerFound = true
-	}
-	d.containersMU.RUnlock()
-
-	if !containerFound {
-		return NewPutEndpointIDLabelsNotFound()
+	if err = endpoint.APICanModify(ep); err != nil {
+		return PatchEndpointIDInvalidCode, err
 	}
 
-	d.SetEndpointIdentity(ep, contID, "", identity)
+	if err := ep.ModifyIdentityLabels(d, addLabels, delLabels); err != nil {
+		return PatchEndpointIDLabelsNotFoundCode, err
+	}
 
-	// FIXME if the labels weren't changed do we still need to regenerate?
-	ep.Regenerate(d)
-
-	return nil
+	return PatchEndpointIDLabelsOKCode, nil
 }
 
 type putEndpointIDLabels struct {
 	daemon *Daemon
 }
 
-func NewPutEndpointIDLabelsHandler(d *Daemon) PutEndpointIDLabelsHandler {
+func NewPatchEndpointIDLabelsHandler(d *Daemon) PatchEndpointIDLabelsHandler {
 	return &putEndpointIDLabels{daemon: d}
 }
 
-func (h *putEndpointIDLabels) Handle(params PutEndpointIDLabelsParams) middleware.Responder {
+func (h *putEndpointIDLabels) Handle(params PatchEndpointIDLabelsParams) middleware.Responder {
+	log.WithField(logfields.Params, logfields.Repr(params)).Debug("PATCH /endpoint/{id}/labels request")
+
 	d := h.daemon
-
-	log.Debugf("PUT /endpoint/{id}/labels %+v", params)
-
 	mod := params.Configuration
-	add := labels.NewLabelsFromModel(mod.Add)
-	del := labels.NewLabelsFromModel(mod.Delete)
+	lbls := labels.NewLabelsFromModel(mod.User)
 
-	err := d.UpdateSecLabels(params.ID, add, del)
+	add := labels.Labels{}
+	del := labels.Labels{}
+
+	ep, err := endpointmanager.Lookup(params.ID)
 	if err != nil {
-		return err
+		return NewPatchEndpointIDLabelsNotFound()
 	}
 
-	return NewPutEndpointIDLabelsOK()
+	ep.Mutex.RLock()
+	currentLbls := ep.OpLabels.DeepCopy()
+	ep.Mutex.RUnlock()
+
+	for _, lbl := range lbls {
+		if currentLbls.Custom[lbl.Key] == nil {
+			add[lbl.Key] = lbl
+		}
+	}
+
+	for _, currLbl := range currentLbls.Custom {
+		if lbls[currLbl.Key] == nil {
+			del[currLbl.Key] = currLbl
+		}
+	}
+
+	// FIXME Somewhere in the code we crash if these are non-nil but length 0. We
+	// retain this behaviour here because it's easier.
+	if len(del) == 0 {
+		del = nil
+	}
+	if len(add) == 0 {
+		add = nil
+	}
+
+	code, err := d.updateEndpointLabelsFromAPI(params.ID, add, del)
+	if err != nil {
+		return apierror.Error(code, err)
+	}
+	return NewPatchEndpointIDLabelsOK()
+}
+
+// OnIPIdentityCacheChange is called whenever there is a change of state in the
+// IPCache (pkg/ipcache).
+// TODO (FIXME): GH-3161.
+func (d *Daemon) OnIPIdentityCacheChange(modType ipcache.CacheModification, ipIDPair identity.IPIdentityPair) {
+
+	log.WithFields(logrus.Fields{logfields.Modification: modType,
+		logfields.IPAddr:   ipIDPair.IP,
+		logfields.IPMask:   ipIDPair.Mask,
+		logfields.Identity: ipIDPair.ID}).
+		Debug("daemon notified of IP-Identity cache state change")
+
+	// TODO - see if we can factor this into an interface under something like
+	// pkg/datapath instead of in the daemon directly so that the code is more
+	// logically located.
+
+	// Update BPF Maps.
+	key := ipCacheBPF.NewKey(ipIDPair.IP, ipIDPair.Mask)
+
+	switch modType {
+	case ipcache.Upsert:
+		value := ipCacheBPF.RemoteEndpointInfo{SecurityIdentity: uint16(ipIDPair.ID)}
+		err := ipCacheBPF.IPCache.Update(key, &value)
+		if err != nil {
+			log.WithError(err).WithFields(logrus.Fields{"key": key.String(),
+				"value": value.String()}).
+				Warning("unable to update bpf map")
+		}
+	case ipcache.Delete:
+		err := ipCacheBPF.IPCache.Delete(key)
+		if err != nil {
+			log.WithError(err).WithFields(logrus.Fields{"key": key.String()}).
+				Warning("unable to delete from bpf map")
+		}
+	default:
+		log.WithField("modificationType", modType).Warning("cache modification type not supported")
+	}
+}
+
+// OnIPIdentityCacheGC spawns a controller which synchronizes the BPF IPCache Map
+// with the in-memory IP-Identity cache.
+func (d *Daemon) OnIPIdentityCacheGC() {
+
+	// This controller ensures that the in-memory IP-identity cache is in-sync
+	// with the BPF map on disk. These can get out of sync if the cilium-agent
+	// is offline for some time, as the maps persist on the BPF filesystem.
+	// In the case that there is some loss of event history in the key-value
+	// store (e.g., compaction in etcd), we cannot rely upon the key-value store
+	// fully to give us the history of all events. As such, periodically check
+	// for inconsistencies in the data-path with that in the agent to ensure
+	// consistent state.
+	controller.NewManager().UpdateController("ipcache-bpf-garbage-collection",
+		controller.ControllerParams{
+			DoFunc: func() error {
+
+				// Since controllers run asynchronously, need to make sure
+				// IPIdentityCache is not being updated concurrently while we do
+				// GC;
+				ipcache.IPIdentityCache.RLock()
+				defer ipcache.IPIdentityCache.RUnlock()
+
+				keysToRemove := map[ipCacheBPF.Key]struct{}{}
+
+				// Add all keys which are in BPF map but not in in-memory cache
+				// to set of keys to remove from BPF map.
+				cb := func(key bpf.MapKey, value bpf.MapValue) {
+					k := key.(ipCacheBPF.Key)
+					keyToIP := k.String()
+
+					// Don't RLock as part of the same goroutine.
+					if _, exists := ipcache.IPIdentityCache.LookupByPrefixRLocked(keyToIP); !exists {
+						// Cannot delete from map during callback because DumpWithCallback
+						// RLocks the map.
+						keysToRemove[k] = struct{}{}
+					}
+				}
+
+				if err := ipCacheBPF.IPCache.DumpWithCallback(cb); err != nil {
+					return fmt.Errorf("error dumping ipcache BPF map: %s", err)
+				}
+
+				// Remove all keys which are not in in-memory cache from BPF map
+				// for consistency.
+				for k := range keysToRemove {
+					log.WithFields(logrus.Fields{logfields.BPFMapKey: k}).
+						Debug("deleting from ipcache BPF map")
+					if err := ipCacheBPF.IPCache.Delete(k); err != nil {
+						return fmt.Errorf("error deleting key %s from ipcache BPF map: %s", k, err)
+					}
+				}
+				return nil
+			},
+			RunInterval: time.Duration(5) * time.Minute,
+		})
 }

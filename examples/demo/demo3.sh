@@ -15,10 +15,10 @@ trap cleanup EXIT
 
 docker network rm $NETWORK > /dev/null 2>&1
 docker network create --ipv6 --subnet ::1/112 --driver cilium --ipam-driver cilium $NETWORK > /dev/null
-cilium policy delete root
+cilium policy delete --all
 
 desc "Policy enforcement is disabled by default, enable it."
-run "cilium config Policy=true"
+run "cilium config PolicyEnforcement=always"
 
 desc "How to debug a connectivity issue?"
 desc "Start client and server containers"

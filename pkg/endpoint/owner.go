@@ -15,9 +15,10 @@
 package endpoint
 
 import (
-	"github.com/cilium/cilium/pkg/labels"
+	"github.com/cilium/cilium/pkg/identity"
+	"github.com/cilium/cilium/pkg/lock"
+	"github.com/cilium/cilium/pkg/monitor"
 	"github.com/cilium/cilium/pkg/policy"
-	"github.com/cilium/cilium/pkg/proxy"
 )
 
 // Owner is the interface defines the requirements for anybody owning policies.
@@ -28,26 +29,30 @@ type Owner interface {
 	// Must return true if dry mode is enabled
 	DryModeEnabled() bool
 
-	// PolicyEnabled returns true if policy enforcement has been enabled
-	PolicyEnabled() bool
+	// EnableEndpointPolicyEnforcement returns whether policy enforcement
+	// should be enabled for the specified endpoint.
+	EnableEndpointPolicyEnforcement(e *Endpoint) (bool, bool)
 
-	// Must return an instance of a ConsumableCache
-	GetConsumableCache() *policy.ConsumableCache
+	// GetPolicyEnforcementType returns the type of policy enforcement for the Owner.
+	PolicyEnforcement() string
 
-	// Must resolve label id to an identiy
-	GetCachedLabelList(ID policy.NumericIdentity) ([]*labels.Label, error)
+	// Must return the policy repository
+	GetPolicyRepository() *policy.Repository
 
-	// Must return the policy tree object
-	GetPolicyTree() *policy.Tree
+	// UpdateProxyRedirect must update the redirect configuration of an endpoint in the proxy
+	UpdateProxyRedirect(e *Endpoint, l4 *policy.L4Filter) (uint16, error)
 
-	// Return the next available global identity
-	GetCachedMaxLabelID() (policy.NumericIdentity, error)
+	// RemoveProxyRedirect must remove the redirect installed by UpdateProxyRedirect
+	RemoveProxyRedirect(e *Endpoint, id string) error
 
-	// Must return proxy object
-	GetProxy() *proxy.Proxy
+	// UpdateNetworkPolicy adds or updates a network policy in the set
+	// published to L7 proxies.
+	UpdateNetworkPolicy(e *Endpoint, policy *policy.L4Policy,
+		labelsMap identity.IdentityCache, deniedIngressIdentities, deniedEgressIdentities map[identity.NumericIdentity]bool) error
 
-	// Must synchronize endpoint object with datapath
-	WriteEndpoint(ep *Endpoint) error
+	// RemoveNetworkPolicy removes a network policy from the set published to
+	// L7 proxies.
+	RemoveNetworkPolicy(e *Endpoint)
 
 	// GetStateDir must return path to the state directory
 	GetStateDir() string
@@ -58,11 +63,21 @@ type Owner interface {
 	// QueueEndpointBuild puts the given request in the processing queue
 	QueueEndpointBuild(*Request)
 
-	// RemoveFromEndpointQueue removes all requests from the working que
+	// RemoveFromEndpointQueue removes all requests from the working queue
 	RemoveFromEndpointQueue(epID uint64)
 
 	// Returns true if debugging has been enabled
 	DebugEnabled() bool
+
+	// TunnelMode
+	GetTunnelMode() string
+
+	// GetCompilationLock returns the mutex responsible for synchronizing compilation
+	// of BPF programs.
+	GetCompilationLock() *lock.RWMutex
+
+	// SendNotification is called to emit an agent notification
+	SendNotification(typ monitor.AgentNotification, text string) error
 }
 
 // Request is used to create the endpoint's request and send it to the endpoints

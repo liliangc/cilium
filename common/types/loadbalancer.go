@@ -19,10 +19,16 @@ import (
 	"fmt"
 	"net"
 	"strings"
-	"sync"
 
 	"github.com/cilium/cilium/api/v1/models"
+	"github.com/cilium/cilium/pkg/lock"
+	"github.com/cilium/cilium/pkg/logging"
+	"github.com/cilium/cilium/pkg/logging/logfields"
+
+	"github.com/sirupsen/logrus"
 )
+
+var log = logging.DefaultLogger
 
 const (
 	NONE = L4Type("NONE")
@@ -47,6 +53,10 @@ type LBBackEnd struct {
 	Weight uint16
 }
 
+func (lbbe *LBBackEnd) String() string {
+	return fmt.Sprintf("%s, weight: %d", lbbe.L3n4Addr.String(), lbbe.Weight)
+}
+
 // LBSVC is essentially used for the REST API.
 type LBSVC struct {
 	Sha256 string
@@ -60,17 +70,22 @@ func (s *LBSVC) GetModel() *models.Service {
 	}
 
 	id := int64(s.FE.ID)
-	svc := &models.Service{
+	spec := &models.ServiceSpec{
 		ID:               id,
 		FrontendAddress:  s.FE.GetModel(),
 		BackendAddresses: make([]*models.BackendAddress, len(s.BES)),
 	}
 
 	for i, be := range s.BES {
-		svc.BackendAddresses[i] = be.GetBackendModel()
+		spec.BackendAddresses[i] = be.GetBackendModel()
 	}
 
-	return svc
+	return &models.Service{
+		Spec: spec,
+		Status: &models.ServiceStatus{
+			Realized: spec,
+		},
+	}
 }
 
 // SVCMap is a map of the daemon's services. The key is the sha256sum of the LBSVC's FE
@@ -86,12 +101,12 @@ type RevNATMap map[ServiceID]L3n4Addr
 // LoadBalancer is the internal representation of the loadbalancer in the local cilium
 // daemon.
 type LoadBalancer struct {
-	BPFMapMU  sync.RWMutex
+	BPFMapMU  lock.RWMutex
 	SVCMap    SVCMap
 	SVCMapID  SVCMapID
 	RevNATMap RevNATMap
 
-	K8sMU        sync.Mutex
+	K8sMU        lock.Mutex
 	K8sServices  map[K8sServiceNamespace]*K8sServiceInfo
 	K8sEndpoints map[K8sServiceNamespace]*K8sServiceEndpoint
 	K8sIngress   map[K8sServiceNamespace]*K8sServiceInfo
@@ -99,17 +114,29 @@ type LoadBalancer struct {
 
 // AddService adds a service to list of loadbalancers and returns true if created.
 func (lb *LoadBalancer) AddService(svc LBSVC) bool {
+	scopedLog := log.WithFields(logrus.Fields{
+		logfields.ServiceName: svc.FE.String(),
+		logfields.SHA:         svc.Sha256,
+	})
+
 	oldSvc, ok := lb.SVCMapID[svc.FE.ID]
 	if ok {
-		// If service already existed, remove old entry from map
+		// If service already existed, remove old entry from Cilium's map
+		scopedLog.Debug("service is already in lb.SVCMapID; deleting old entry and updating it with new entry")
 		delete(lb.SVCMap, oldSvc.Sha256)
 	}
+	scopedLog.Debug("adding service to loadbalancer")
 	lb.SVCMap[svc.Sha256] = svc
 	lb.SVCMapID[svc.FE.ID] = &svc
 	return !ok
 }
 
+// DeleteService deletes svc from lb's SVCMap and SVCMapID.
 func (lb *LoadBalancer) DeleteService(svc *LBSVC) {
+	log.WithFields(logrus.Fields{
+		logfields.ServiceName: svc.FE.String(),
+		logfields.SHA:         svc.Sha256,
+	}).Debug("deleting service from loadbalancer")
 	delete(lb.SVCMap, svc.Sha256)
 	delete(lb.SVCMapID, svc.FE.ID)
 }
@@ -139,27 +166,38 @@ func NewLoadBalancer() *LoadBalancer {
 
 // K8sServiceNamespace is an abstraction for the k8s service + namespace types.
 type K8sServiceNamespace struct {
-	Service   string
-	Namespace string
+	ServiceName string `json:"serviceName,omitempty"`
+	Namespace   string `json:"namespace,omitempty"`
 }
 
 // K8sServiceInfo is an abstraction for a k8s service that is composed by the frontend IP
 // address (FEIP) and the map of the frontend ports (Ports).
 type K8sServiceInfo struct {
-	FEIP  net.IP
-	Ports map[FEPortName]*FEPort
+	FEIP       net.IP
+	IsHeadless bool
+	Ports      map[FEPortName]*FEPort
+	Labels     map[string]string
+	Selector   map[string]string
+}
+
+// IsExternal returns true if the service is expected to serve out-of-cluster endpoints:
+func (si K8sServiceInfo) IsExternal() bool {
+	return len(si.Selector) == 0
 }
 
 // NewK8sServiceInfo creates a new K8sServiceInfo with the Ports map initialized.
-func NewK8sServiceInfo(ip net.IP) *K8sServiceInfo {
+func NewK8sServiceInfo(ip net.IP, headless bool, labels map[string]string, selector map[string]string) *K8sServiceInfo {
 	return &K8sServiceInfo{
-		FEIP:  ip,
-		Ports: map[FEPortName]*FEPort{},
+		FEIP:       ip,
+		IsHeadless: headless,
+		Ports:      map[FEPortName]*FEPort{},
+		Labels:     labels,
+		Selector:   selector,
 	}
 }
 
 // K8sServiceEndpoint is an abstraction for the k8s endpoint object. Each service is
-// composed by a map of backend IPs (BEIPs) and a map of Ports (Ports). Each k8s endpoint
+// composed by a set of backend IPs (BEIPs) and a map of Ports (Ports). Each k8s endpoint
 // present in BEIPs share the same list of Ports open.
 type K8sServiceEndpoint struct {
 	// TODO: Replace bool for time.Time so we know last time the service endpoint was seen?
@@ -225,7 +263,11 @@ func NewL3n4Addr(protocol L4Type, ip net.IP, portNumber uint16) (*L3n4Addr, erro
 	if err != nil {
 		return nil, err
 	}
-	return &L3n4Addr{IP: ip, L4Addr: *lbport}, nil
+
+	addr := L3n4Addr{IP: ip, L4Addr: *lbport}
+	log.WithField(logfields.IPAddr, addr).Debug("created new L3n4Addr")
+
+	return &addr, nil
 }
 
 func NewL3n4AddrFromModel(base *models.FrontendAddress) (*L3n4Addr, error) {
@@ -260,10 +302,14 @@ func NewLBBackEnd(protocol L4Type, ip net.IP, portNumber uint16, weight uint16) 
 	if err != nil {
 		return nil, err
 	}
-	return &LBBackEnd{
+
+	lbbe := LBBackEnd{
 		L3n4Addr: L3n4Addr{IP: ip, L4Addr: *lbport},
 		Weight:   weight,
-	}, nil
+	}
+	log.WithField("backend", lbbe).Debug("created new LBBackend")
+
+	return &lbbe, nil
 }
 
 func NewLBBackEndFromBackendModel(base *models.BackendAddress) (*LBBackEnd, error) {
@@ -360,7 +406,7 @@ func (a L3n4Addr) SHA256Sum() string {
 	}()
 
 	str := []byte(fmt.Sprintf("%+v", a))
-	return fmt.Sprintf("%x", sha512.New512_256().Sum(str))
+	return fmt.Sprintf("%x", sha512.Sum512_256(str))
 }
 
 // IsIPv6 returns true if the IP address in the given L3n4Addr is IPv6 or not.
@@ -404,7 +450,12 @@ func (l *L3n4AddrID) IsIPv6() bool {
 // beIndex and the new 'be' will be inserted on index beIndex-1 of that new array. All
 // remaining be elements will be kept on the same index and, in case the new array is
 // larger than the number of backends, some elements will be empty.
-func (svcs SVCMap) AddFEnBE(fe *L3n4AddrID, be *LBBackEnd, beIndex int) {
+func (svcs SVCMap) AddFEnBE(fe *L3n4AddrID, be *LBBackEnd, beIndex int) *LBSVC {
+	log.WithFields(logrus.Fields{
+		"frontend":     fe,
+		"backend":      be,
+		"backendIndex": beIndex,
+	}).Debug("adding frontend and backend to SVCMap")
 	sha := fe.SHA256Sum()
 
 	var lbsvc LBSVC
@@ -438,5 +489,7 @@ func (svcs SVCMap) AddFEnBE(fe *L3n4AddrID, be *LBBackEnd, beIndex int) {
 		}
 	}
 
+	lbsvc.Sha256 = sha
 	svcs[sha] = lbsvc
+	return &lbsvc
 }

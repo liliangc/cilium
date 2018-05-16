@@ -1,4 +1,4 @@
-// Copyright 2016-2017 Authors of Cilium
+// Copyright 2016-2018 Authors of Cilium
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,7 +22,22 @@ import (
 	"time"
 
 	consulAPI "github.com/hashicorp/consul/api"
+	. "gopkg.in/check.v1"
 )
+
+type ConsulSuite struct {
+	BaseTests
+}
+
+var _ = Suite(&ConsulSuite{})
+
+func (e *ConsulSuite) SetUpTest(c *C) {
+	SetupDummy("consul")
+}
+
+func (e *ConsulSuite) TearDownTest(c *C) {
+	Close()
+}
 
 var handler http.HandlerFunc
 
@@ -43,38 +58,6 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-func TestConsulClientRetry(t *testing.T) {
-	maxRetries = 3
-	retrySleep = time.Second
-	tries := 0
-	doneC := make(chan struct{})
-
-	handler = func(w http.ResponseWriter, r *http.Request) {
-		if tries++; tries+1 == maxRetries {
-			close(doneC)
-		}
-
-		http.Error(w, "retry test error", http.StatusInternalServerError)
-	}
-
-	_, err := NewConsulClient(&consulAPI.Config{
-		Address: ":8000",
-	})
-
-	select {
-	case <-doneC:
-	case <-time.After(time.Second * 5):
-		t.Log("timeout")
-		t.FailNow()
-	}
-
-	// we should get a failure
-	if err == nil {
-		t.Log("no error")
-		t.FailNow()
-	}
-}
-
 func TestConsulClientOk(t *testing.T) {
 	maxRetries = 3
 	doneC := make(chan struct{})
@@ -84,7 +67,7 @@ func TestConsulClientOk(t *testing.T) {
 		close(doneC)
 	}
 
-	_, err := NewConsulClient(&consulAPI.Config{
+	_, err := newConsulClient(&consulAPI.Config{
 		Address: ":8000",
 	})
 

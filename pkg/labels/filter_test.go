@@ -15,7 +15,7 @@
 package labels
 
 import (
-	"github.com/cilium/cilium/common"
+	"github.com/cilium/cilium/pkg/comparator"
 
 	. "gopkg.in/check.v1"
 )
@@ -27,11 +27,20 @@ var _ = Suite(&LabelsPrefCfgSuite{})
 
 func (s *LabelsPrefCfgSuite) TestFilterLabels(c *C) {
 	wanted := Labels{
-		"id.lizards":     NewLabel("id.lizards", "web", common.CiliumLabelSource),
-		"id.lizards.k8s": NewLabel("id.lizards.k8s", "web", common.K8sLabelSource),
+		"id.lizards":                  NewLabel("id.lizards", "web", LabelSourceContainer),
+		"id.lizards.k8s":              NewLabel("id.lizards.k8s", "web", LabelSourceK8s),
+		"io.kubernetes.pod.namespace": NewLabel("io.kubernetes.pod.namespace", "default", LabelSourceContainer),
 	}
 
-	dlpcfg := DefaultLabelPrefixCfg()
+	dlpcfg := defaultLabelPrefixCfg()
+	d, err := parseLabelPrefix("!ignor[eE]")
+	c.Assert(err, IsNil)
+	c.Assert(d, Not(IsNil))
+	dlpcfg.LabelPrefixes = append(dlpcfg.LabelPrefixes, d)
+	d, err = parseLabelPrefix("id.*")
+	c.Assert(err, IsNil)
+	c.Assert(d, Not(IsNil))
+	dlpcfg.LabelPrefixes = append(dlpcfg.LabelPrefixes, d)
 	allNormalLabels := map[string]string{
 		"io.kubernetes.container.hash":                   "cf58006d",
 		"io.kubernetes.container.name":                   "POD",
@@ -39,19 +48,24 @@ func (s *LabelsPrefCfgSuite) TestFilterLabels(c *C) {
 		"io.kubernetes.container.terminationMessagePath": "",
 		"io.kubernetes.pod.name":                         "my-nginx-3800858182-07i3n",
 		"io.kubernetes.pod.namespace":                    "default",
+		"annotation.kubectl.kubernetes.io":               "foo",
 		"io.kubernetes.pod.terminationGracePeriod":       "30",
 		"io.kubernetes.pod.uid":                          "c2e22414-dfc3-11e5-9792-080027755f5a",
+		"ignore":                                         "foo",
+		"ignorE":                                         "foo",
+		"annotation.kubernetes.io/config.seen": "2017-05-30T14:22:17.691491034Z",
+		"controller-revision-hash":             "123456",
 	}
-	allLabels := Map2Labels(allNormalLabels, common.CiliumLabelSource)
-	filtered := dlpcfg.FilterLabels(allLabels)
-	c.Assert(len(filtered), Equals, 0)
-	allLabels["id.lizards"] = NewLabel("id.lizards", "web", common.CiliumLabelSource)
-	allLabels["id.lizards.k8s"] = NewLabel("id.lizards.k8s", "web", common.K8sLabelSource)
-	filtered = dlpcfg.FilterLabels(allLabels)
-	c.Assert(len(filtered), Equals, 2)
-	c.Assert(filtered, DeepEquals, wanted)
+	allLabels := Map2Labels(allNormalLabels, LabelSourceContainer)
+	filtered, _ := dlpcfg.filterLabels(allLabels)
+	c.Assert(len(filtered), Equals, 1)
+	allLabels["id.lizards"] = NewLabel("id.lizards", "web", LabelSourceContainer)
+	allLabels["id.lizards.k8s"] = NewLabel("id.lizards.k8s", "web", LabelSourceK8s)
+	filtered, _ = dlpcfg.filterLabels(allLabels)
+	c.Assert(len(filtered), Equals, 3)
+	c.Assert(filtered, comparator.DeepEquals, wanted)
 
 	// Making sure we are deep copying the labels
 	allLabels["id.lizards"].Source = "I can change this and doesn't affect any one"
-	c.Assert(filtered, DeepEquals, wanted)
+	c.Assert(filtered, comparator.DeepEquals, wanted)
 }

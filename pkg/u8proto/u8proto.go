@@ -20,14 +20,25 @@ import (
 	"strings"
 )
 
-var protoNames = map[int]string{
+const (
+	// All represents all protocols.
+	All    U8proto = 0
+	ICMP   U8proto = 1
+	TCP    U8proto = 6
+	UDP    U8proto = 17
+	ICMPv6 U8proto = 58
+)
+
+var protoNames = map[U8proto]string{
+	0:  "all",
 	1:  "ICMP",
 	6:  "TCP",
 	17: "UDP",
 	58: "ICMPv6",
 }
 
-var protoIDs = map[string]U8proto{
+var ProtoIDs = map[string]U8proto{
+	"all":    0,
 	"icmp":   1,
 	"tcp":    6,
 	"udp":    17,
@@ -36,17 +47,15 @@ var protoIDs = map[string]U8proto{
 
 type U8proto uint8
 
-func (p *U8proto) String() string {
-	proto := int(*p)
-
-	if _, ok := protoNames[proto]; ok {
-		return protoNames[proto]
+func (p U8proto) String() string {
+	if _, ok := protoNames[p]; ok {
+		return protoNames[p]
 	}
-	return strconv.Itoa(proto)
+	return strconv.Itoa(int(p))
 }
 
 func ParseProtocol(proto string) (U8proto, error) {
-	if u, ok := protoIDs[strings.ToLower(proto)]; ok {
+	if u, ok := ProtoIDs[strings.ToLower(proto)]; ok {
 		return u, nil
 	}
 	return 0, fmt.Errorf("unknown protocol '%s'", proto)
